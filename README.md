@@ -131,3 +131,118 @@ Status
 	•	✅ Protocol designed
 	•	🚧 Hardware specs in progress
 	•	🚧 Real-world testing pending
+
+
+How it works depth:
+
+Small ΔV impulse (0.5-2.0 mm/s)
+↓
+Changes orbital period slightly
+↓
+Alters phase rate between satellites
+↓
+Detectable by RF tracking
+↓
+Encodes information
+
+
+Three satellites with prime harmonic periods (2:3:5) create three independent channels.
+
+A 40-bit seed deterministically generates the orbital evolution → complete schedule.
+
+---
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Raw capacity | 0.011 bps |
+| Effective capacity | 0.117 bps (post-expansion) |
+| Min detectable ΔV | 0.5 mm/s |
+| Propellant/symbol | 0.05 grams |
+| Duty cycle | 0.17% |
+| Solar storm resilient | Yes (12% error @ 10× noise) |
+
+---
+
+## Quick Start
+
+```bash
+# Clone
+git clone https://github.com/JinnZ2/orbital-phycom.git
+cd orbital-phycom
+
+# Install
+pip install -r requirements.txt
+
+# Run basic simulation (30 seconds)
+python simulations/01_basic_orbital_sim.py
+
+# Run three-satellite demo (2 minutes)
+python simulations/02_three_satellite_demo.py
+
+
+Output: Graphs showing orbital deviation encoding and decoding.
+What Makes This Novel
+1. Physics as Compression
+	•	Don’t transmit data → transmit seed
+	•	Orbital mechanics expands seed deterministically
+	•	6,944× compression via shared physics
+2. Fractal Multi-Scale Encoding
+	•	Same seed encodes information at multiple timescales:
+	•	Seconds: Phase rate jumps
+	•	Hours: Orbital period changes
+	•	Days: Constellation geometry evolution
+	•	Based on geometric intelligence framework
+3. Stealth by Design
+	•	0.17% duty cycle
+	•	ΔV impulses indistinguishable from station-keeping
+	•	No conventional RF signature
+	•	Detectable only by constellation partners with matching physics model
+4. Extreme Sensitivity
+	•	Matched filtering detects 0.5 mm/s ΔV impulses
+	•	That’s 0.0000066% of orbital velocity
+	•	Survives 10× noise increase (solar storms)
+
+orbital-phycom/
+├── core/              # Orbital mechanics + seed expansion
+├── detection/         # Signal processing algorithms
+├── network/           # Multi-satellite systems
+├── protocol/          # Complete PHYCOM protocol
+├── simulations/       # Runnable demos
+├── analysis/          # Theory + capacity calculations
+├── docs/              # Specifications + guides
+└── tests/             # Unit tests
+
+
+Use Cases
+Constellation Control
+	•	Broadcast single seed to all satellites
+	•	Each expands to personalized schedule
+	•	Saves 99% ground station bandwidth
+Stealth Operations
+	•	Ultra-low observability
+	•	Appears as natural orbital drift
+	•	No RF emissions
+Deep Space Relays
+	•	Minimal power budget
+	•	Tolerates long delays
+	•	Self-synchronizing
+Resilient Networks
+	•	Survives solar storms
+	•	Self-healing via physics constraints
+	•	No single point of failure
+
+Technical Details
+See <docs/> for:
+	•	Protocol specification
+	•	Orbital mechanics primer
+	•	Seed expansion theory
+	•	Shannon capacity analysis
+	•	Deployment guide
+
+Related work:
+	•	Geometric Intelligence Framework
+	•	Resilience Hydrology
+
+Warning: This is research code. Not flight-qualified. Use at your own risk.
