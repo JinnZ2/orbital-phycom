@@ -317,3 +317,8 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+###Minor Code Notes
+Imports `scipy.interpolate` dynamically—ensure it’s in `requirements.txt`. Interpolation handles minor time mismatches gracefully. Output PNG + console stats make it demo-ready.
