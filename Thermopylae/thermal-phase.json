@@ -1,0 +1,374 @@
+import { useState, useMemo, useCallback } from “react”;
+
+// ─── PHYSICS ENGINE ───────────────────────────────────────────
+// Stefan-Boltzmann: P_rad = ε σ A T⁴
+// Compute power → waste heat fraction → required radiator area
+// Constraint: radiator mass vs. launch cost vs. compute density
+
+const STEFAN_BOLTZMANN = 5.670374419e-8; // W·m⁻²·K⁻⁴
+const SOLAR_FLUX_LEO = 1361; // W/m² (average)
+
+function computeThermalState(params) {
+const {
+computePower_kW,
+efficiency,       // fraction of power → useful compute (rest → heat)
+radiatorTemp_K,
+emissivity,
+sinkTemp_K,       // space ~3K, lunar surface ~200-380K
+radiatorDensity,  // kg/m² of radiator panel
+launchCost,       // $/kg to orbit
+computeDensity,   // FLOPS/W
+} = params;
+
+const computePower_W = computePower_kW * 1000;
+const wasteHeat_W = computePower_W * (1 - efficiency);
+
+// Radiative power per m² = εσ(T_rad⁴ - T_sink⁴)
+const radPower_per_m2 =
+emissivity * STEFAN_BOLTZMANN * (Math.pow(radiatorTemp_K, 4) - Math.pow(sinkTemp_K, 4));
+
+const radiatorArea_m2 = radPower_per_m2 > 0 ? wasteHeat_W / radPower_per_m2 : Infinity;
+const radiatorMass_kg = radiatorArea_m2 * radiatorDensity;
+const radiatorLaunchCost = radiatorMass_kg * launchCost;
+
+// Total FLOPS capacity
+const usefulPower_W = computePower_W * efficiency;
+const totalFLOPS = usefulPower_W * computeDensity * 1e9; // GFLOPS/W → FLOPS
+
+// Compute per radiator area — the key metric
+const flopsPerRadiatorM2 = radiatorArea_m2 > 0 ? totalFLOPS / radiatorArea_m2 : 0;
+
+// Cost per PFLOPS
+const totalPFLOPS = totalFLOPS / 1e15;
+const costPerPFLOPS = totalPFLOPS > 0 ? radiatorLaunchCost / totalPFLOPS : Infinity;
+
+// Solar absorption load (if in LEO, radiator absorbs sunlight too)
+const solarLoad_W = radiatorArea_m2 * SOLAR_FLUX_LEO * (1 - emissivity) * 0.5; // half-sky avg
+
+return {
+wasteHeat_W,
+radPower_per_m2,
+radiatorArea_m2,
+radiatorMass_kg,
+radiatorLaunchCost,
+totalFLOPS,
+totalPFLOPS,
+flopsPerRadiatorM2,
+costPerPFLOPS,
+solarLoad_W,
+netCoolingCapacity_W: (radPower_per_m2 * radiatorArea_m2) - solarLoad_W,
+};
+}
+
+// Generate phase space sweep
+function sweepParameter(baseParams, paramKey, min, max, steps) {
+const results = [];
+for (let i = 0; i <= steps; i++) {
+const val = min + (max - min) * (i / steps);
+const params = { …baseParams, [paramKey]: val };
+const state = computeThermalState(params);
+results.push({ x: val, …state });
+}
+return results;
+}
+
+// ─── UI COMPONENTS ────────────────────────────────────────────
+
+const PARAM_DEFS = [
+{ key: “computePower_kW”, label: “Compute Power”, unit: “kW”, min: 10, max: 5000, step: 10, default: 500 },
+{ key: “efficiency”, label: “Efficiency”, unit: “”, min: 0.05, max: 0.95, step: 0.01, default: 0.35 },
+{ key: “radiatorTemp_K”, label: “Radiator Temp”, unit: “K”, min: 250, max: 600, step: 5, default: 350 },
+{ key: “emissivity”, label: “Emissivity ε”, unit: “”, min: 0.5, max: 0.98, step: 0.01, default: 0.92 },
+{ key: “sinkTemp_K”, label: “Sink Temp”, unit: “K”, min: 3, max: 380, step: 1, default: 3 },
+{ key: “radiatorDensity”, label: “Radiator Mass”, unit: “kg/m²”, min: 1, max: 20, step: 0.5, default: 5 },
+{ key: “launchCost”, label: “Launch Cost”, unit: “$/kg”, min: 100, max: 10000, step: 100, default: 2700 },
+{ key: “computeDensity”, label: “Compute Density”, unit: “GFLOPS/W”, min: 1, max: 200, step: 1, default: 50 },
+];
+
+const PRESETS = {
+“LEO Free-Flyer”: { computePower_kW: 500, efficiency: 0.35, radiatorTemp_K: 350, emissivity: 0.92, sinkTemp_K: 3, radiatorDensity: 5, launchCost: 2700, computeDensity: 50 },
+“Lunar Surface”: { computePower_kW: 200, efficiency: 0.30, radiatorTemp_K: 400, emissivity: 0.90, sinkTemp_K: 280, radiatorDensity: 8, launchCost: 5000, computeDensity: 50 },
+“L2 Deep Space”: { computePower_kW: 1000, efficiency: 0.40, radiatorTemp_K: 300, emissivity: 0.95, sinkTemp_K: 3, radiatorDensity: 3, launchCost: 4000, computeDensity: 80 },
+“Mars Surface”: { computePower_kW: 100, efficiency: 0.25, radiatorTemp_K: 350, emissivity: 0.88, sinkTemp_K: 210, radiatorDensity: 10, launchCost: 8000, computeDensity: 30 },
+};
+
+function fmt(n, digits = 1) {
+if (!isFinite(n)) return “∞”;
+if (Math.abs(n) >= 1e15) return (n / 1e15).toFixed(digits) + “ P”;
+if (Math.abs(n) >= 1e12) return (n / 1e12).toFixed(digits) + “ T”;
+if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(digits) + “ G”;
+if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(digits) + “ M”;
+if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(digits) + “ k”;
+return n.toFixed(digits);
+}
+
+function fmtCost(n) {
+if (!isFinite(n)) return “∞”;
+if (n >= 1e9) return “$” + (n / 1e9).toFixed(1) + “B”;
+if (n >= 1e6) return “$” + (n / 1e6).toFixed(1) + “M”;
+if (n >= 1e3) return “$” + (n / 1e3).toFixed(1) + “k”;
+return “$” + n.toFixed(0);
+}
+
+// Mini SVG chart for phase space
+function MiniChart({ data, xKey, yKey, xLabel, yLabel, color, highlight }) {
+const W = 300, H = 140, PAD = 32;
+const xs = data.map(d => d[xKey]);
+const ys = data.map(d => d[yKey]).map(v => isFinite(v) ? v : 0);
+const xMin = Math.min(…xs), xMax = Math.max(…xs);
+const yMin = Math.min(…ys), yMax = Math.max(…ys);
+const sx = (v) => PAD + ((v - xMin) / (xMax - xMin || 1)) * (W - PAD * 2);
+const sy = (v) => H - PAD - ((v - yMin) / (yMax - yMin || 1)) * (H - PAD * 2);
+
+const pathD = data.map((d, i) => {
+const x = sx(d[xKey]);
+const y = sy(isFinite(d[yKey]) ? d[yKey] : 0);
+return `${i === 0 ? "M" : "L"}${x},${y}`;
+}).join(” “);
+
+// highlight point
+const hx = sx(highlight);
+const hIdx = data.reduce((best, d, i) =>
+Math.abs(d[xKey] - highlight) < Math.abs(data[best][xKey] - highlight) ? i : best, 0);
+const hy = sy(isFinite(data[hIdx][yKey]) ? data[hIdx][yKey] : 0);
+
+return (
+<svg viewBox={`0 0 ${W} ${H}`} style={{ width: “100%”, maxWidth: 340, height: “auto” }}>
+{/* grid lines */}
+{[0.25, 0.5, 0.75].map(f => (
+<line key={f} x1={PAD} x2={W - PAD} y1={sy(yMin + f * (yMax - yMin))} y2={sy(yMin + f * (yMax - yMin))}
+stroke=”#1a2a3a” strokeWidth={0.5} />
+))}
+{/* curve */}
+<path d={pathD} fill="none" stroke={color} strokeWidth={2} opacity={0.9} />
+{/* glow */}
+<path d={pathD} fill="none" stroke={color} strokeWidth={5} opacity={0.15} />
+{/* highlight dot */}
+<circle cx={hx} cy={hy} r={5} fill={color} opacity={0.9} />
+<circle cx={hx} cy={hy} r={9} fill={color} opacity={0.2} />
+{/* axes labels */}
+<text x={W / 2} y={H - 4} textAnchor=“middle” fill=”#5a7a8a” fontSize={9} fontFamily=“monospace”>{xLabel}</text>
+<text x={4} y={H / 2} textAnchor=“middle” fill=”#5a7a8a” fontSize={9} fontFamily=“monospace”
+transform={`rotate(-90, 4, ${H / 2})`}>{yLabel}</text>
+{/* range labels */}
+<text x={PAD} y={H - PAD + 12} textAnchor=“start” fill=”#3a5a6a” fontSize={8} fontFamily=“monospace”>{fmt(xMin, 0)}</text>
+<text x={W - PAD} y={H - PAD + 12} textAnchor=“end” fill=”#3a5a6a” fontSize={8} fontFamily=“monospace”>{fmt(xMax, 0)}</text>
+</svg>
+);
+}
+
+// ─── MAIN ─────────────────────────────────────────────────────
+
+export default function ThermalPhaseSpace() {
+const [params, setParams] = useState(PRESETS[“LEO Free-Flyer”]);
+const [activePreset, setActivePreset] = useState(“LEO Free-Flyer”);
+const [sweepParam, setSweepParam] = useState(“radiatorTemp_K”);
+
+const setParam = useCallback((key, val) => {
+setParams(p => ({ …p, [key]: val }));
+setActivePreset(null);
+}, []);
+
+const state = useMemo(() => computeThermalState(params), [params]);
+
+const sweepDef = PARAM_DEFS.find(p => p.key === sweepParam);
+const sweepData = useMemo(() =>
+sweepParameter(params, sweepParam, sweepDef.min, sweepDef.max, 80),
+[params, sweepParam, sweepDef]
+);
+
+// Thermal viability indicator
+const viability = state.netCoolingCapacity_W > 0
+? state.netCoolingCapacity_W > state.wasteHeat_W * 0.5 ? “viable” : “marginal”
+: “fail”;
+
+const viabilityColor = { viable: “#00ffaa”, marginal: “#ffaa00”, fail: “#ff4444” }[viability];
+
+return (
+<div style={{
+background: “#0a0e14”,
+color: “#c0d0d8”,
+minHeight: “100vh”,
+fontFamily: “‘JetBrains Mono’, ‘Fira Code’, ‘SF Mono’, monospace”,
+fontSize: 13,
+padding: “12px 10px”,
+maxWidth: 420,
+margin: “0 auto”,
+}}>
+{/* Header */}
+<div style={{ borderBottom: “1px solid #1a2a3a”, paddingBottom: 8, marginBottom: 12 }}>
+<div style={{ fontSize: 15, color: “#00ccaa”, fontWeight: 700, letterSpacing: 1 }}>
+THERMAL PHASE SPACE
+</div>
+<div style={{ fontSize: 10, color: “#3a5a6a”, marginTop: 2 }}>
+Space DC Heat Rejection Constraints
+</div>
+</div>
+
+```
+  {/* Presets */}
+  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 14 }}>
+    {Object.keys(PRESETS).map(name => (
+      <button key={name} onClick={() => { setParams(PRESETS[name]); setActivePreset(name); }}
+        style={{
+          background: activePreset === name ? "#00ccaa15" : "#0d1520",
+          border: `1px solid ${activePreset === name ? "#00ccaa" : "#1a2a3a"}`,
+          color: activePreset === name ? "#00ccaa" : "#5a7a8a",
+          borderRadius: 4, padding: "4px 8px", fontSize: 10,
+          cursor: "pointer", fontFamily: "inherit",
+        }}>
+        {name}
+      </button>
+    ))}
+  </div>
+
+  {/* Status bar */}
+  <div style={{
+    display: "grid", gridTemplateColumns: "1fr 1fr",
+    gap: 6, marginBottom: 14,
+  }}>
+    {[
+      { label: "Radiator", value: fmt(state.radiatorArea_m2, 0) + " m²", sub: fmt(state.radiatorMass_kg, 0) + " kg" },
+      { label: "Waste Heat", value: fmt(state.wasteHeat_W) + "W", sub: ((1 - params.efficiency) * 100).toFixed(0) + "% of input" },
+      { label: "Compute", value: fmt(state.totalFLOPS) + "FLOPS", sub: state.totalPFLOPS.toFixed(1) + " PFLOPS" },
+      { label: "Launch Cost", value: fmtCost(state.radiatorLaunchCost), sub: fmtCost(state.costPerPFLOPS) + "/PFLOPS" },
+    ].map(({ label, value, sub }) => (
+      <div key={label} style={{
+        background: "#0d1520", border: "1px solid #1a2a3a",
+        borderRadius: 4, padding: "6px 8px",
+      }}>
+        <div style={{ fontSize: 9, color: "#3a5a6a", textTransform: "uppercase", letterSpacing: 1 }}>{label}</div>
+        <div style={{ fontSize: 14, color: "#e0f0f4", fontWeight: 600, marginTop: 2 }}>{value}</div>
+        <div style={{ fontSize: 9, color: "#4a6a7a", marginTop: 1 }}>{sub}</div>
+      </div>
+    ))}
+  </div>
+
+  {/* Viability */}
+  <div style={{
+    background: "#0d1520", border: `1px solid ${viabilityColor}40`,
+    borderRadius: 4, padding: "6px 10px", marginBottom: 14,
+    display: "flex", alignItems: "center", gap: 8,
+  }}>
+    <div style={{
+      width: 8, height: 8, borderRadius: "50%",
+      background: viabilityColor,
+      boxShadow: `0 0 8px ${viabilityColor}60`,
+    }} />
+    <div>
+      <span style={{ color: viabilityColor, fontSize: 11, fontWeight: 600 }}>
+        {viability.toUpperCase()}
+      </span>
+      <span style={{ color: "#4a6a7a", fontSize: 10, marginLeft: 8 }}>
+        rad: {fmt(state.radPower_per_m2, 0)} W/m² | solar load: {fmt(state.solarLoad_W)}W
+      </span>
+    </div>
+  </div>
+
+  {/* Phase space charts */}
+  <div style={{ marginBottom: 14 }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+      <span style={{ fontSize: 10, color: "#3a5a6a" }}>SWEEP:</span>
+      <select value={sweepParam} onChange={e => setSweepParam(e.target.value)}
+        style={{
+          background: "#0d1520", border: "1px solid #1a2a3a",
+          color: "#00ccaa", borderRadius: 4, padding: "3px 6px",
+          fontSize: 10, fontFamily: "inherit",
+        }}>
+        {PARAM_DEFS.map(p => (
+          <option key={p.key} value={p.key}>{p.label}</option>
+        ))}
+      </select>
+    </div>
+
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <MiniChart data={sweepData} xKey="x" yKey="radiatorArea_m2"
+        xLabel={sweepDef.label} yLabel="Rad Area m²"
+        color="#00ccaa" highlight={params[sweepParam]} />
+      <MiniChart data={sweepData} xKey="x" yKey="costPerPFLOPS"
+        xLabel={sweepDef.label} yLabel="$/PFLOPS"
+        color="#ff6644" highlight={params[sweepParam]} />
+    </div>
+  </div>
+
+  {/* T⁴ scaling visualizer */}
+  <div style={{
+    background: "#0d1520", border: "1px solid #1a2a3a",
+    borderRadius: 4, padding: "8px 10px", marginBottom: 14,
+  }}>
+    <div style={{ fontSize: 9, color: "#3a5a6a", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>
+      T⁴ SCALING — RADIATOR TEMP vs REJECTION RATE
+    </div>
+    <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 60 }}>
+      {[200, 250, 300, 350, 400, 450, 500, 550, 600].map(T => {
+        const power = params.emissivity * STEFAN_BOLTZMANN * (Math.pow(T, 4) - Math.pow(params.sinkTemp_K, 4));
+        const maxPower = params.emissivity * STEFAN_BOLTZMANN * (Math.pow(600, 4) - Math.pow(params.sinkTemp_K, 4));
+        const h = Math.max(2, (power / maxPower) * 56);
+        const isActive = Math.abs(T - params.radiatorTemp_K) < 30;
+        return (
+          <div key={T} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+            <div style={{
+              width: "100%", height: h, borderRadius: 2,
+              background: isActive
+                ? `linear-gradient(180deg, #00ccaa, #006655)`
+                : `linear-gradient(180deg, #1a3040, #0d1520)`,
+              transition: "height 0.3s",
+            }} />
+            <div style={{ fontSize: 7, color: isActive ? "#00ccaa" : "#2a4050" }}>{T}</div>
+          </div>
+        );
+      })}
+    </div>
+    <div style={{ fontSize: 8, color: "#3a5a6a", marginTop: 4, textAlign: "center" }}>
+      W/m² at current ε and T_sink
+    </div>
+  </div>
+
+  {/* Sliders */}
+  <div style={{ marginBottom: 12 }}>
+    <div style={{ fontSize: 9, color: "#3a5a6a", textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>
+      PARAMETERS
+    </div>
+    {PARAM_DEFS.map(({ key, label, unit, min, max, step }) => (
+      <div key={key} style={{ marginBottom: 10 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+          <span style={{ fontSize: 10, color: "#5a7a8a" }}>{label}</span>
+          <span style={{ fontSize: 10, color: "#00ccaa", fontWeight: 600 }}>
+            {params[key]}{unit ? ` ${unit}` : ""}
+          </span>
+        </div>
+        <input type="range" min={min} max={max} step={step}
+          value={params[key]}
+          onChange={e => setParam(key, parseFloat(e.target.value))}
+          style={{
+            width: "100%", height: 20,
+            accentColor: "#00ccaa",
+            cursor: "pointer",
+          }}
+        />
+      </div>
+    ))}
+  </div>
+
+  {/* Key tension callout */}
+  <div style={{
+    background: "#0d1520", border: "1px solid #1a2a3a",
+    borderRadius: 4, padding: "8px 10px", marginBottom: 12,
+    fontSize: 10, color: "#4a6a7a", lineHeight: 1.5,
+  }}>
+    <span style={{ color: "#ff6644", fontWeight: 700 }}>CORE TENSION: </span>
+    Compute density scales ~linear with power. Heat rejection scales with T⁴ but
+    radiator <em>area</em> scales linearly with waste heat. So doubling compute
+    = doubling radiator mass = doubling launch cost. The only escape hatches
+    are efficiency (less waste heat per FLOP), higher radiator temps
+    (T⁴ leverage), or cheaper launches.
+  </div>
+
+  <div style={{ fontSize: 8, color: "#1a2a3a", textAlign: "center", padding: 8 }}>
+    Stefan-Boltzmann model · ε σ (T⁴_rad - T⁴_sink)
+  </div>
+</div>
+```
+
+);
+}
