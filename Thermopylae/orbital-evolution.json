@@ -1,0 +1,672 @@
+import { useState, useMemo, useCallback, useRef } from “react”;
+
+// ═══════════════════════════════════════════════════════════════
+// EVOLUTIONARY BOOTSTRAP ENGINE
+// ═══════════════════════════════════════════════════════════════
+
+// Feedstock types encountered in orbit
+const FEEDSTOCK_TYPES = {
+centaur_tank: { name: “Centaur Tank”, al_kg: 800, composite_kg: 50, chips: 0, solar_m2: 0, xe_kg: 5, prob: 0.08, mass: 900 },
+dead_starlink: { name: “Dead Starlink”, al_kg: 80, composite_kg: 30, chips: 4, solar_m2: 8, xe_kg: 0, prob: 0.45, mass: 120 },
+delta_stage: { name: “Delta Stage”, al_kg: 1200, composite_kg: 100, chips: 0, solar_m2: 0, xe_kg: 15, prob: 0.05, mass: 1400 },
+old_comsat: { name: “Old Comsat”, al_kg: 200, composite_kg: 80, chips: 12, solar_m2: 20, xe_kg: 8, prob: 0.12, mass: 350 },
+debris_cloud: { name: “Debris Cloud”, al_kg: 30, composite_kg: 10, chips: 0, solar_m2: 0, xe_kg: 0, prob: 0.25, mass: 50 },
+panel_fragment: { name: “Panel Fragment”, al_kg: 15, composite_kg: 5, chips: 0, solar_m2: 3, xe_kg: 0, prob: 0.05, mass: 25 },
+};
+
+// Phenotype templates — what a seed can express
+const PHENOTYPES = {
+radiator_node: {
+name: “Radiator Node”, icon: “▦”,
+needs: { al_kg: 1200, composite_kg: 50, chips: 2, solar_m2: 10 },
+produces: { rad_area_m2: 500, compute_kW: 5, cooling_capacity_kW: 85 },
+build_days: 30, mass_kg: 1500,
+},
+compute_node: {
+name: “Compute Node”, icon: “⚡”,
+needs: { al_kg: 400, composite_kg: 80, chips: 20, solar_m2: 40 },
+produces: { rad_area_m2: 150, compute_kW: 50, cooling_capacity_kW: 25 },
+build_days: 45, mass_kg: 800,
+},
+collector: {
+name: “Collector”, icon: “◎”,
+needs: { al_kg: 200, composite_kg: 30, chips: 1, solar_m2: 5 },
+produces: { rad_area_m2: 20, compute_kW: 0, cooling_capacity_kW: 3, capture_rate: 2.0 },
+build_days: 15, mass_kg: 400,
+},
+seed: {
+name: “Seed Factory”, icon: “❋”,
+needs: { al_kg: 500, composite_kg: 100, chips: 8, solar_m2: 15 },
+produces: { rad_area_m2: 50, compute_kW: 2, cooling_capacity_kW: 8, build_rate: 1.0 },
+build_days: 60, mass_kg: 1000,
+},
+};
+
+// Fitness function: revenue per kg per month
+function nodeFitness(phenotype, marketState) {
+const p = PHENOTYPES[phenotype];
+if (!p) return 0;
+const computeRev = p.produces.compute_kW * marketState.computePrice_kW_month;
+const coolingRev = p.produces.cooling_capacity_kW * marketState.coolingPrice_kW_month;
+const captureRev = (p.produces.capture_rate || 0) * marketState.debrisPrice_per_ton * 0.05; // tons/month
+const totalRev = computeRev + coolingRev + captureRev;
+return totalRev / p.mass_kg;
+}
+
+// Phenotype selection: what should we build given feedstock and market?
+function selectPhenotype(stockpile, marketState) {
+// Check what we CAN build
+const buildable = Object.keys(PHENOTYPES).filter(key => {
+const needs = PHENOTYPES[key].needs;
+return stockpile.al_kg >= needs.al_kg &&
+stockpile.composite_kg >= needs.composite_kg &&
+stockpile.chips >= needs.chips &&
+stockpile.solar_m2 >= needs.solar_m2;
+});
+
+if (buildable.length === 0) return null;
+
+// Fitness-weighted selection
+const fitnesses = buildable.map(k => ({ key: k, fitness: nodeFitness(k, marketState) }));
+
+// Boost seed production if population is small
+const seedBoost = marketState.totalNodes < 5 ? 3.0 : marketState.totalNodes < 15 ? 1.5 : 0.5;
+// Boost collectors if stockpile is low
+const collectorBoost = stockpile.al_kg < 2000 ? 2.5 : 0.8;
+
+fitnesses.forEach(f => {
+if (f.key === “seed”) f.fitness *= seedBoost;
+if (f.key === “collector”) f.fitness *= collectorBoost;
+});
+
+// Pick highest fitness
+fitnesses.sort((a, b) => b.fitness - a.fitness);
+return fitnesses[0]?.key || null;
+}
+
+// Run one generation (1 month)
+function simulateGeneration(state, params) {
+const { population, stockpile, month, history, marketState } = state;
+
+// ── CAPTURE PHASE ─────────────────────────────────────────
+// Each seed/collector captures junk
+let captures = [];
+let newStockpile = { …stockpile };
+const captureNodes = population.filter(n => n.type === “seed” || n.type === “collector”);
+const captureRate = captureNodes.reduce((s, n) => {
+const p = PHENOTYPES[n.type];
+return s + (p.produces.capture_rate || 0.3); // seeds capture slowly
+}, 0);
+
+// Probabilistic captures this month
+const numCaptures = Math.floor(captureRate * params.captureMultiplier);
+for (let i = 0; i < numCaptures; i++) {
+// Roll for feedstock type
+const roll = Math.random();
+let cumProb = 0;
+for (const [key, fs] of Object.entries(FEEDSTOCK_TYPES)) {
+cumProb += fs.prob;
+if (roll < cumProb) {
+captures.push(key);
+newStockpile.al_kg += fs.al_kg;
+newStockpile.composite_kg += fs.composite_kg;
+newStockpile.chips += fs.chips;
+newStockpile.solar_m2 += fs.solar_m2;
+newStockpile.xe_kg += fs.xe_kg;
+newStockpile.totalCaptured_tons += fs.mass / 1000;
+break;
+}
+}
+}
+
+// ── BUILD PHASE ───────────────────────────────────────────
+// Each seed tries to build something
+let newPopulation = […population];
+let built = [];
+const seeds = population.filter(n => n.type === “seed”);
+
+for (const seed of seeds) {
+// Update market state for selection
+const ms = {
+…marketState,
+totalNodes: newPopulation.length,
+};
+const phenotype = selectPhenotype(newStockpile, ms);
+if (phenotype) {
+const needs = PHENOTYPES[phenotype].needs;
+// Check build time (simplified: 1 build per seed per month if fast enough)
+if (PHENOTYPES[phenotype].build_days <= 30 || Math.random() > 0.5) {
+newStockpile.al_kg -= needs.al_kg;
+newStockpile.composite_kg -= needs.composite_kg;
+newStockpile.chips -= needs.chips;
+newStockpile.solar_m2 -= needs.solar_m2;
+const newNode = {
+type: phenotype,
+born: month,
+id: `${phenotype.charAt(0).toUpperCase()}${month}-${Math.floor(Math.random() * 100)}`,
+};
+newPopulation.push(newNode);
+built.push(phenotype);
+}
+}
+}
+
+// ── REVENUE PHASE ─────────────────────────────────────────
+let monthlyRevenue = 0;
+let totalCompute = 0;
+let totalCooling = 0;
+let totalRadArea = 0;
+
+for (const node of newPopulation) {
+const p = PHENOTYPES[node.type];
+if (!p) continue;
+totalCompute += p.produces.compute_kW;
+totalCooling += p.produces.cooling_capacity_kW;
+totalRadArea += p.produces.rad_area_m2;
+monthlyRevenue += nodeFitness(node.type, marketState) * p.mass_kg;
+}
+
+// Debris cleanup revenue
+const cleanupRevenue = newStockpile.totalCaptured_tons * params.debrisPrice_per_ton * 0.1; // 10% realized/month
+
+// ── SELECTION (RECYCLING) ─────────────────────────────────
+// Recycle lowest-fitness nodes if population exceeds capacity
+if (newPopulation.length > params.maxNodes) {
+const scored = newPopulation.map((n, i) => ({
+idx: i, fitness: nodeFitness(n.type, marketState), node: n
+}));
+scored.sort((a, b) => a.fitness - b.fitness);
+const toRecycle = scored.slice(0, newPopulation.length - params.maxNodes);
+for (const r of toRecycle) {
+const p = PHENOTYPES[r.node.type];
+// Return 60% of materials
+newStockpile.al_kg += p.needs.al_kg * 0.6;
+newStockpile.composite_kg += p.needs.composite_kg * 0.6;
+newStockpile.chips += Math.floor(p.needs.chips * 0.4);
+}
+const recycleIdxs = new Set(toRecycle.map(r => r.idx));
+newPopulation = newPopulation.filter((_, i) => !recycleIdxs.has(i));
+}
+
+// ── MARKET DYNAMICS ───────────────────────────────────────
+// Compute price drops as supply increases (diminishing returns)
+const newMarket = { …marketState };
+newMarket.computePrice_kW_month = Math.max(50, 500 / (1 + totalCompute / 100));
+newMarket.coolingPrice_kW_month = Math.max(10, 200 / (1 + totalCooling / 200));
+newMarket.totalNodes = newPopulation.length;
+
+const genRecord = {
+month: month + 1,
+population: newPopulation.length,
+seeds: newPopulation.filter(n => n.type === “seed”).length,
+radiators: newPopulation.filter(n => n.type === “radiator_node”).length,
+computes: newPopulation.filter(n => n.type === “compute_node”).length,
+collectors: newPopulation.filter(n => n.type === “collector”).length,
+totalCompute,
+totalCooling,
+totalRadArea,
+monthlyRevenue,
+cleanupRevenue,
+captures: numCaptures,
+built,
+stockpile_al: newStockpile.al_kg,
+stockpile_chips: newStockpile.chips,
+totalCaptured_tons: newStockpile.totalCaptured_tons,
+computePrice: newMarket.computePrice_kW_month,
+};
+
+return {
+population: newPopulation,
+stockpile: newStockpile,
+month: month + 1,
+history: […history, genRecord],
+marketState: newMarket,
+};
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UI HELPERS
+// ═══════════════════════════════════════════════════════════════
+const fmt = (n, d = 1) => {
+if (!isFinite(n)) return “∞”;
+const a = Math.abs(n);
+if (a >= 1e6) return (n / 1e6).toFixed(d) + “M”;
+if (a >= 1e3) return (n / 1e3).toFixed(d) + “k”;
+return n.toFixed(d);
+};
+const fW = w => w >= 1e3 ? (w / 1e3).toFixed(1) + “ MW” : w.toFixed(0) + “ kW”;
+const f$ = n => n >= 1e6 ? “$” + (n / 1e6).toFixed(1) + “M” : n >= 1e3 ? “$” + (n / 1e3).toFixed(1) + “k” : “$” + n.toFixed(0);
+
+function MiniTimeline({ history, yKey, label, color, maxH = 60 }) {
+if (history.length < 2) return null;
+const vals = history.map(h => h[yKey]);
+const maxV = Math.max(…vals, 1);
+const W = 300, H = maxH, P = 2;
+return (
+<div style={{ marginBottom: 6 }}>
+<div style={{ display: “flex”, justifyContent: “space-between”, fontSize: 8, color: “#4a6a7a”, marginBottom: 2 }}>
+<span style={{ color }}>{label}</span>
+<span>{fmt(vals[vals.length - 1])}</span>
+</div>
+<svg viewBox={`0 0 ${W} ${H}`} style={{ width: “100%”, maxWidth: 340, height: “auto” }}>
+{/* Area fill */}
+<path d={
+history.map((h, i) => {
+const x = P + (i / (history.length - 1)) * (W - P * 2);
+const y = H - P - (h[yKey] / maxV) * (H - P * 2);
+return `${i === 0 ? "M" : "L"}${x},${y}`;
+}).join(” “) + ` L${W - P},${H - P} L${P},${H - P} Z`
+} fill={`${color}15`} />
+{/* Line */}
+<path d={
+history.map((h, i) => {
+const x = P + (i / (history.length - 1)) * (W - P * 2);
+const y = H - P - (h[yKey] / maxV) * (H - P * 2);
+return `${i === 0 ? "M" : "L"}${x},${y}`;
+}).join(” “)
+} fill=“none” stroke={color} strokeWidth={1.5} />
+</svg>
+</div>
+);
+}
+
+// Population composition stacked bar
+function PopBar({ history }) {
+if (history.length === 0) return null;
+const colors = { seeds: “#ffcc00”, radiators: “#00ccaa”, computes: “#4488ff”, collectors: “#ff8844” };
+return (
+<div style={{ marginBottom: 8 }}>
+<div style={{ fontSize: 8, color: “#3a5a6a”, marginBottom: 3 }}>POPULATION COMPOSITION</div>
+<div style={{ display: “flex”, flexDirection: “column”, gap: 1 }}>
+{history.slice(-24).map((h, i) => {
+const total = h.population || 1;
+return (
+<div key={i} style={{ display: “flex”, height: 6, borderRadius: 1, overflow: “hidden” }}>
+{[“seeds”, “radiators”, “computes”, “collectors”].map(k => (
+<div key={k} style={{
+width: `${(h[k] / total) * 100}%`,
+background: colors[k],
+minWidth: h[k] > 0 ? 1 : 0,
+transition: “width 0.2s”,
+}} />
+))}
+</div>
+);
+})}
+</div>
+<div style={{ display: “flex”, gap: 8, marginTop: 3 }}>
+{Object.entries(colors).map(([k, c]) => (
+<div key={k} style={{ display: “flex”, alignItems: “center”, gap: 2 }}>
+<div style={{ width: 6, height: 6, borderRadius: 1, background: c }} />
+<span style={{ fontSize: 7, color: “#4a6a7a” }}>{k}</span>
+</div>
+))}
+</div>
+</div>
+);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// INITIAL STATE
+// ═══════════════════════════════════════════════════════════════
+function makeInitialState() {
+return {
+population: [{ type: “seed”, born: 0, id: “S0-PRIME” }],
+stockpile: { al_kg: 0, composite_kg: 0, chips: 0, solar_m2: 0, xe_kg: 0, totalCaptured_tons: 0 },
+month: 0,
+history: [],
+marketState: {
+computePrice_kW_month: 500,   // $/kW/month
+coolingPrice_kW_month: 200,    // $/kW/month
+debrisPrice_per_ton: 1000000,  // $1M/ton cleanup credit
+totalNodes: 1,
+},
+};
+}
+
+const SIM_PARAMS = {
+captureMultiplier: 1.0,
+debrisPrice_per_ton: 1000000,
+maxNodes: 100,
+};
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════
+export default function EvolutionaryBootstrap() {
+const [simState, setSimState] = useState(makeInitialState());
+const [params, setParams] = useState(SIM_PARAMS);
+const [tab, setTab] = useState(“sim”);
+const [running, setRunning] = useState(false);
+const runRef = useRef(false);
+
+const setP = useCallback((k, v) => setParams(p => ({ …p, [k]: v })), []);
+
+const stepOnce = useCallback(() => {
+setSimState(prev => simulateGeneration(prev, params));
+}, [params]);
+
+const stepN = useCallback((n) => {
+setSimState(prev => {
+let state = prev;
+for (let i = 0; i < n; i++) {
+state = simulateGeneration(state, params);
+}
+return state;
+});
+}, [params]);
+
+const reset = useCallback(() => {
+setSimState(makeInitialState());
+setRunning(false);
+runRef.current = false;
+}, []);
+
+// Auto-run
+const toggleRun = useCallback(() => {
+if (running) {
+setRunning(false);
+runRef.current = false;
+} else {
+setRunning(true);
+runRef.current = true;
+const tick = () => {
+if (!runRef.current) return;
+setSimState(prev => simulateGeneration(prev, params));
+setTimeout(tick, 200);
+};
+tick();
+}
+}, [running, params]);
+
+const s = simState;
+const latest = s.history[s.history.length - 1];
+
+const tabBtn = (t, label) => (
+<button onClick={() => setTab(t)} style={{
+flex: 1, padding: “6px 0”, textAlign: “center”, fontSize: 9, fontWeight: 600,
+color: tab === t ? “#00ccaa” : “#3a5a6a”, background: tab === t ? “#00ccaa08” : “transparent”,
+border: “none”, borderBottom: `2px solid ${tab === t ? "#00ccaa" : "#1a2a3a"}`,
+cursor: “pointer”, fontFamily: “inherit”,
+}}>{label}</button>
+);
+
+const phenoColor = { seed: “#ffcc00”, radiator_node: “#00ccaa”, compute_node: “#4488ff”, collector: “#ff8844” };
+
+return (
+<div style={{
+background: “#0a0e14”, color: “#c0d0d8”, minHeight: “100vh”,
+fontFamily: “‘JetBrains Mono’,‘Fira Code’,‘SF Mono’,monospace”,
+fontSize: 13, padding: “12px 10px”, maxWidth: 420, margin: “0 auto”,
+}}>
+{/* Header */}
+<div style={{ borderBottom: “1px solid #1a2a3a”, paddingBottom: 8, marginBottom: 10 }}>
+<div style={{ fontSize: 13, color: “#00ccaa”, fontWeight: 700, letterSpacing: 1.5 }}>ORBITAL EVOLUTION</div>
+<div style={{ fontSize: 9, color: “#3a5a6a”, marginTop: 2 }}>
+Genome → Phenotype → Selection · Junk = feedstock
+</div>
+</div>
+
+```
+  {/* Controls */}
+  <div style={{ display: "flex", gap: 4, marginBottom: 10 }}>
+    <button onClick={stepOnce} style={{ flex: 1, background: "#0d1520", border: "1px solid #00ccaa40", borderRadius: 4, padding: "6px", color: "#00ccaa", fontSize: 10, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+      +1 MONTH
+    </button>
+    <button onClick={() => stepN(6)} style={{ flex: 1, background: "#0d1520", border: "1px solid #4488ff40", borderRadius: 4, padding: "6px", color: "#4488ff", fontSize: 10, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+      +6 MONTHS
+    </button>
+    <button onClick={toggleRun} style={{ flex: 1, background: running ? "#ff444415" : "#0d1520", border: `1px solid ${running ? "#ff4444" : "#ffaa44"}40`, borderRadius: 4, padding: "6px", color: running ? "#ff4444" : "#ffaa44", fontSize: 10, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+      {running ? "STOP" : "AUTO"}
+    </button>
+    <button onClick={reset} style={{ background: "#0d1520", border: "1px solid #3a5a6a40", borderRadius: 4, padding: "6px 10px", color: "#3a5a6a", fontSize: 10, cursor: "pointer", fontFamily: "inherit" }}>
+      RESET
+    </button>
+  </div>
+
+  {/* Status bar */}
+  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4, marginBottom: 10 }}>
+    {[
+      { l: "MONTH", v: s.month, c: "#ffffff" },
+      { l: "NODES", v: s.population.length, c: "#00ccaa" },
+      { l: "COMPUTE", v: latest ? fW(latest.totalCompute) : "0", c: "#4488ff" },
+      { l: "CAPTURED", v: fmt(s.stockpile.totalCaptured_tons, 0) + "t", c: "#ff8844" },
+    ].map(({ l, v, c }) => (
+      <div key={l} style={{ background: "#0d1520", border: `1px solid ${c}20`, borderRadius: 4, padding: "4px", textAlign: "center" }}>
+        <div style={{ fontSize: 7, color: "#3a5a6a" }}>{l}</div>
+        <div style={{ fontSize: 13, color: c, fontWeight: 700 }}>{v}</div>
+      </div>
+    ))}
+  </div>
+
+  {/* Tabs */}
+  <div style={{ display: "flex", marginBottom: 10 }}>
+    {tabBtn("sim", "EVOLUTION")}
+    {tabBtn("pop", "POPULATION")}
+    {tabBtn("stock", "STOCKPILE")}
+    {tabBtn("rules", "GENOME")}
+  </div>
+
+  {/* ━━━ EVOLUTION ━━━ */}
+  {tab === "sim" && <>
+    <PopBar history={s.history} />
+    <MiniTimeline history={s.history} yKey="population" label="Population" color="#00ccaa" />
+    <MiniTimeline history={s.history} yKey="totalCompute" label="Compute kW" color="#4488ff" />
+    <MiniTimeline history={s.history} yKey="totalCaptured_tons" label="Captured (tons)" color="#ff8844" />
+    <MiniTimeline history={s.history} yKey="monthlyRevenue" label="Revenue $/mo" color="#ffcc00" />
+    <MiniTimeline history={s.history} yKey="computePrice" label="Compute $/kW/mo" color="#8866cc" />
+
+    {/* Latest generation events */}
+    {latest && (
+      <div style={{ background: "#0d1520", border: "1px solid #1a2a3a", borderRadius: 4, padding: "6px 8px", marginTop: 6 }}>
+        <div style={{ fontSize: 8, color: "#3a5a6a", marginBottom: 4 }}>MONTH {latest.month} EVENTS</div>
+        <div style={{ fontSize: 9, color: "#5a7a8a", lineHeight: 1.6 }}>
+          Captured {latest.captures} targets.
+          {latest.built.length > 0
+            ? ` Built: ${latest.built.map(b => PHENOTYPES[b]?.icon + " " + PHENOTYPES[b]?.name).join(", ")}.`
+            : " Insufficient feedstock to build."
+          }
+          {" "}Revenue: {f$(latest.monthlyRevenue)}/mo + {f$(latest.cleanupRevenue)} cleanup.
+        </div>
+      </div>
+    )}
+  </>}
+
+  {/* ━━━ POPULATION ━━━ */}
+  {tab === "pop" && <>
+    {/* Type summary */}
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 10 }}>
+      {Object.entries(PHENOTYPES).map(([key, p]) => {
+        const count = s.population.filter(n => n.type === key).length;
+        const c = phenoColor[key] || "#5a7a8a";
+        return (
+          <div key={key} style={{ background: "#0d1520", border: `1px solid ${c}20`, borderRadius: 4, padding: "6px 8px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: 14 }}>{p.icon}</span>
+              <span style={{ fontSize: 18, color: c, fontWeight: 700 }}>{count}</span>
+            </div>
+            <div style={{ fontSize: 9, color: c, fontWeight: 600 }}>{p.name}</div>
+            <div style={{ fontSize: 8, color: "#3a4a5a", marginTop: 2 }}>
+              {p.produces.compute_kW}kW compute · {p.produces.rad_area_m2}m² rad
+            </div>
+          </div>
+        );
+      })}
+    </div>
+
+    {/* Node list (last 20) */}
+    <div style={{ fontSize: 8, color: "#3a5a6a", marginBottom: 4 }}>
+      ROSTER ({s.population.length} nodes)
+    </div>
+    <div style={{ maxHeight: 300, overflowY: "auto" }}>
+      {s.population.slice(-20).reverse().map((node, i) => {
+        const p = PHENOTYPES[node.type];
+        const c = phenoColor[node.type] || "#5a7a8a";
+        return (
+          <div key={node.id + i} style={{
+            display: "flex", alignItems: "center", gap: 6,
+            padding: "3px 6px", marginBottom: 2,
+            background: "#0d1520", borderRadius: 3, border: `1px solid ${c}15`,
+          }}>
+            <span style={{ fontSize: 12 }}>{p?.icon}</span>
+            <span style={{ fontSize: 9, color: c, fontWeight: 600, width: 60 }}>{node.id}</span>
+            <span style={{ fontSize: 8, color: "#4a6a7a", flex: 1 }}>{p?.name}</span>
+            <span style={{ fontSize: 8, color: "#3a5a6a" }}>born M{node.born}</span>
+          </div>
+        );
+      })}
+    </div>
+  </>}
+
+  {/* ━━━ STOCKPILE ━━━ */}
+  {tab === "stock" && <>
+    <div style={{ background: "#0d1520", border: "1px solid #1a2a3a", borderRadius: 4, padding: "8px 10px", marginBottom: 10 }}>
+      <div style={{ fontSize: 9, color: "#ff8844", fontWeight: 700, marginBottom: 6 }}>MATERIAL STOCKPILE</div>
+      {[
+        { l: "Aluminum", v: fmt(s.stockpile.al_kg, 0) + " kg", c: "#c0c0c0", pct: s.stockpile.al_kg },
+        { l: "Composites", v: fmt(s.stockpile.composite_kg, 0) + " kg", c: "#4a8a4a", pct: s.stockpile.composite_kg },
+        { l: "Chips", v: s.stockpile.chips + " units", c: "#4488ff", pct: s.stockpile.chips * 50 },
+        { l: "Solar Cells", v: fmt(s.stockpile.solar_m2, 0) + " m²", c: "#ffcc00", pct: s.stockpile.solar_m2 * 20 },
+        { l: "Xenon", v: fmt(s.stockpile.xe_kg, 0) + " kg", c: "#8866cc", pct: s.stockpile.xe_kg * 10 },
+      ].map(({ l, v, c, pct: p }) => {
+        const maxBar = 5000;
+        return (
+          <div key={l} style={{ marginBottom: 4 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, marginBottom: 1 }}>
+              <span style={{ color: "#5a7a8a" }}>{l}</span>
+              <span style={{ color: c, fontWeight: 600 }}>{v}</span>
+            </div>
+            <div style={{ height: 6, background: "#0a0e14", borderRadius: 2, overflow: "hidden" }}>
+              <div style={{ width: `${Math.min(100, (p / maxBar) * 100)}%`, height: "100%", background: c, borderRadius: 2, transition: "width 0.3s", opacity: 0.7 }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+
+    <MiniTimeline history={s.history} yKey="stockpile_al" label="Aluminum (kg)" color="#c0c0c0" />
+    <MiniTimeline history={s.history} yKey="stockpile_chips" label="Chips (units)" color="#4488ff" />
+
+    {/* What can we build? */}
+    <div style={{ background: "#0d1520", border: "1px solid #00ccaa20", borderRadius: 4, padding: "8px 10px", marginTop: 6 }}>
+      <div style={{ fontSize: 9, color: "#00ccaa", fontWeight: 700, marginBottom: 6 }}>BUILDABLE NOW</div>
+      {Object.entries(PHENOTYPES).map(([key, p]) => {
+        const canBuild =
+          s.stockpile.al_kg >= p.needs.al_kg &&
+          s.stockpile.composite_kg >= p.needs.composite_kg &&
+          s.stockpile.chips >= p.needs.chips &&
+          s.stockpile.solar_m2 >= p.needs.solar_m2;
+        const c = phenoColor[key] || "#5a7a8a";
+        return (
+          <div key={key} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+            <div style={{ width: 8, height: 8, borderRadius: "50%", background: canBuild ? "#00ffaa" : "#ff4444" }} />
+            <span style={{ fontSize: 9, color: canBuild ? c : "#3a4a5a", fontWeight: 600 }}>{p.icon} {p.name}</span>
+            <span style={{ fontSize: 8, color: "#3a4a5a", flex: 1, textAlign: "right" }}>
+              {p.needs.al_kg}Al · {p.needs.chips}ch · {p.needs.solar_m2}sol
+            </span>
+          </div>
+        );
+      })}
+    </div>
+
+    {/* Params */}
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 9, color: "#3a5a6a", marginBottom: 4 }}>ENVIRONMENT</div>
+      <div style={{ marginBottom: 6 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, marginBottom: 1 }}>
+          <span style={{ color: "#5a7a8a" }}>Capture Rate Multiplier</span>
+          <span style={{ color: "#ff8844", fontWeight: 600 }}>{params.captureMultiplier.toFixed(1)}×</span>
+        </div>
+        <input type="range" min={0.2} max={3.0} step={0.1} value={params.captureMultiplier}
+          onChange={e => setP("captureMultiplier", parseFloat(e.target.value))}
+          style={{ width: "100%", height: 18, accentColor: "#ff8844", cursor: "pointer" }} />
+      </div>
+      <div style={{ marginBottom: 6 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, marginBottom: 1 }}>
+          <span style={{ color: "#5a7a8a" }}>Max Nodes</span>
+          <span style={{ color: "#00ccaa", fontWeight: 600 }}>{params.maxNodes}</span>
+        </div>
+        <input type="range" min={10} max={200} step={5} value={params.maxNodes}
+          onChange={e => setP("maxNodes", parseInt(e.target.value))}
+          style={{ width: "100%", height: 18, accentColor: "#00ccaa", cursor: "pointer" }} />
+      </div>
+    </div>
+  </>}
+
+  {/* ━━━ GENOME ━━━ */}
+  {tab === "rules" && <>
+    <div style={{ background: "#0d1520", border: "1px solid #ffcc0025", borderRadius: 4, padding: "10px", marginBottom: 10 }}>
+      <div style={{ fontSize: 10, color: "#ffcc00", fontWeight: 700, marginBottom: 8 }}>THE GENOME</div>
+      <div style={{ fontSize: 9, color: "#5a7a8a", lineHeight: 1.7 }}>
+        The 1-ton seed carries five invariant capabilities:
+      </div>
+      {[
+        { cap: "MELT", desc: "Plasma torch. Al @ 660°C. Waste heat feeds TPV.", color: "#ff6644" },
+        { cap: "SORT", desc: "Centrifuge + spectral ID. Alloys, composites, chips, glass.", color: "#ffaa44" },
+        { cap: "PRINT", desc: "Wire-arc AM. Radiator panels, frames, troughs, horn structures.", color: "#00ccaa" },
+        { cap: "ASSEMBLE", desc: "Robotic arms. Dock, connect thermal loops, integrate compute.", color: "#4488ff" },
+        { cap: "COMMUNICATE", desc: "Hot gates. 100 bps thermal Morse. Swarm state broadcast.", color: "#ffcc00" },
+      ].map(({ cap, desc, color }, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 6, marginTop: i === 0 ? 6 : 0 }}>
+          <div style={{ width: 48, fontSize: 9, color, fontWeight: 700, flexShrink: 0, textAlign: "right" }}>{cap}</div>
+          <div style={{ fontSize: 9, color: "#5a7a8a", lineHeight: 1.5 }}>{desc}</div>
+        </div>
+      ))}
+    </div>
+
+    <div style={{ background: "#0d1520", border: "1px solid #00ccaa25", borderRadius: 4, padding: "10px", marginBottom: 10 }}>
+      <div style={{ fontSize: 10, color: "#00ccaa", fontWeight: 700, marginBottom: 8 }}>PHENOTYPE EXPRESSION</div>
+      <div style={{ fontSize: 9, color: "#5a7a8a", lineHeight: 1.7, marginBottom: 6 }}>
+        What gets built depends on feedstock encountered + market demand:
+      </div>
+      {Object.entries(PHENOTYPES).map(([key, p]) => (
+        <div key={key} style={{ marginBottom: 8, padding: "6px", background: "#0a0e14", borderRadius: 3 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span style={{ fontSize: 11, color: phenoColor[key], fontWeight: 700 }}>{p.icon} {p.name}</span>
+            <span style={{ fontSize: 8, color: "#3a5a6a" }}>{p.build_days}d · {p.mass_kg}kg</span>
+          </div>
+          <div style={{ fontSize: 8, color: "#4a6a7a", marginTop: 2 }}>
+            Needs: {p.needs.al_kg}kg Al · {p.needs.composite_kg}kg comp · {p.needs.chips} chips · {p.needs.solar_m2}m² solar
+          </div>
+          <div style={{ fontSize: 8, color: "#5a8a7a", marginTop: 1 }}>
+            Yields: {p.produces.rad_area_m2}m² rad · {p.produces.compute_kW}kW compute · {p.produces.cooling_capacity_kW}kW cooling
+          </div>
+        </div>
+      ))}
+    </div>
+
+    <div style={{ background: "#0d1520", border: "1px solid #ff664425", borderRadius: 4, padding: "10px", marginBottom: 10 }}>
+      <div style={{ fontSize: 10, color: "#ff6644", fontWeight: 700, marginBottom: 6 }}>SELECTION PRESSURE</div>
+      {[
+        { rule: "Fitness = revenue per kg per month", desc: "Nodes that generate more value survive. Thermal economy IS the fitness function." },
+        { rule: "Seed boost when population < 5", desc: "Early growth prioritizes reproduction over specialization." },
+        { rule: "Collector boost when stockpile < 2t Al", desc: "Starvation triggers foraging phenotype expression." },
+        { rule: "Compute price drops with supply", desc: "Oversupply self-corrects: low prices → fewer compute nodes → more radiators/collectors." },
+        { rule: "Recycling returns 60% materials", desc: "Death feeds new life. Failure events become feedstock." },
+      ].map(({ rule, desc }, i) => (
+        <div key={i} style={{ marginBottom: 6 }}>
+          <div style={{ fontSize: 9, color: "#ff8844", fontWeight: 600 }}>{rule}</div>
+          <div style={{ fontSize: 8, color: "#4a6a7a", lineHeight: 1.4 }}>{desc}</div>
+        </div>
+      ))}
+    </div>
+
+    <div style={{
+      background: "#00ccaa06", border: "1px solid #00ccaa15", borderRadius: 4,
+      padding: "8px 10px", fontSize: 9, color: "#5a8a7a", lineHeight: 1.6,
+    }}>
+      <b style={{ color: "#00ccaa" }}>NATURE'S PLAYBOOK: </b>
+      Eat your waste, excrete structure. The orbital junk field is regolith.
+      The seed factory is a genome. The thermal economy is natural selection.
+      The swarm is an ecosystem. Scale to 10 MW by launching 1 ton and waiting.
+    </div>
+  </>}
+
+  <div style={{ fontSize: 7, color: "#1a2a3a", textAlign: "center", padding: 10 }}>
+    Orbital Evolution · Genome → Phenotype → Selection
+  </div>
+</div>
+```
+
+);
+}
