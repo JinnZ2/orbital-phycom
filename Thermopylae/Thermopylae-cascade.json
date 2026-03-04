@@ -1,0 +1,625 @@
+import { useState, useMemo, useCallback } from “react”;
+
+// ═══════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════
+const σ = 5.670374419e-8;
+const k_B = 1.380649e-23;
+const h_planck = 6.62607015e-34;
+const c_light = 2.998e8;
+const PI = Math.PI;
+
+// ═══════════════════════════════════════════════════════════════
+// CASCADE ENGINE
+// Models 1 joule from input → final dump through 5 layers
+// Each layer: takes power in, extracts value, passes remainder
+// ═══════════════════════════════════════════════════════════════
+
+function computeCascade(p) {
+const P_input = p.computePower_kW * 1000; // W
+
+// ── L1: COMPUTE ──────────────────────────────────────────
+const P_compute = P_input * p.efficiency;
+const FLOPS = P_compute * p.computeDensity_GFLOPSW * 1e9;
+const P_waste_L1 = P_input - P_compute;
+// Thermal path efficiency: how much waste heat reaches the loop vs lost in transit
+const P_into_loop = P_waste_L1 * p.thermalPathEff;
+const P_path_loss = P_waste_L1 - P_into_loop;
+
+// ── L2: INTERNAL THERMAL WORK ────────────────────────────
+// Fraction of loop heat tapped for survival/utility heating
+const P_survival = P_into_loop * p.survivalTapFrac;
+// Services: tank heating, battery conditioning, hinge warmth, sensor baselines
+const survivalServices = [
+{ name: “Tank/Prop Heating”, frac: 0.4 },
+{ name: “Battery Conditioning”, frac: 0.25 },
+{ name: “Mech/Hinge Warmth”, frac: 0.2 },
+{ name: “Sensor Baselines”, frac: 0.15 },
+].map(s => ({ …s, power: P_survival * s.frac }));
+const P_after_L2 = P_into_loop - P_survival;
+
+// ── L3: HIGH-VALUE CONVERSION ────────────────────────────
+// TPV / thermoelectric / ORC from hottest loop segments
+const T_hot_loop = p.hotLoopTemp_K;
+const T_cold_sink = p.radTemp_K; // reject to radiator temp
+const carnot_eff = 1 - (T_cold_sink / T_hot_loop);
+const conversion_eff = carnot_eff * p.conversionFracOfCarnot;
+const P_converted = P_after_L2 * p.conversionFrac * conversion_eff;
+const P_conversion_waste = P_after_L2 * p.conversionFrac * (1 - conversion_eff);
+
+// What the converted power feeds
+const conversionServices = [
+{ name: “Telemetry Beacon”, frac: 0.3 },
+{ name: “Clock & Sync”, frac: 0.2 },
+{ name: “Safety Logic”, frac: 0.25 },
+{ name: “Fault Beacon”, frac: 0.25 },
+].map(s => ({ …s, power: P_converted * s.frac }));
+
+const P_after_L3 = P_after_L2 - (P_after_L2 * p.conversionFrac) + P_conversion_waste;
+
+// ── L4: DIRECTIONAL EXPORT (Thermopylae) ─────────────────
+const P_to_radiators = P_after_L3;
+
+// Split: hot segment vs bulk
+const P_hot_segment = P_to_radiators * p.hotSegmentFrac;
+const P_bulk_rad = P_to_radiators - P_hot_segment;
+
+// Hot segment properties
+const T_emit = p.hotSegmentTemp_K;
+const λ_emit = 2.898e-3 / T_emit;
+const ν_emit = c_light / λ_emit;
+
+// Spectral shaping: engineered emissivity
+// ε_band = enhanced emissivity in comms band
+// ε_suppress = reduced emissivity outside band
+// Net effect: fraction of hot segment power in useful band
+const spectralConcentration = p.spectralEfficiency; // fraction in-band
+
+// Spatial: horn geometry
+const q_hot = p.emissivity * σ * (Math.pow(T_emit, 4) - Math.pow(p.sinkTemp_K, 4));
+const A_hot = q_hot > 0 ? P_hot_segment / q_hot : 0;
+const A_per_horn = p.hornAperture_m * p.hornAperture_m;
+const N_horns = Math.max(1, Math.floor(A_hot / A_per_horn));
+const Ω_beam = λ_emit * λ_emit / A_per_horn;
+const beamDiv_arcsec = Math.sqrt(Ω_beam) * 206265;
+
+// Temporal: duty cycle pulsing
+// During ON phase, effective temp is higher (stored thermal mass)
+const T_pulse = T_emit * Math.pow(1 / p.dutyCycle, 0.25); // T⁴ scaling
+const peakBrightnessFactor = Math.pow(T_pulse / T_emit, 4);
+
+// Planck spectral radiance at emit frequency
+const hv_kT = (h_planck * ν_emit) / (k_B * T_emit);
+const B_ν = (2 * h_planck * Math.pow(ν_emit, 3) / (c_light * c_light)) / (Math.exp(hv_kT) - 1);
+
+// Power in directed beam (all horns, in-band, duty-cycle averaged)
+const Δν = p.modBW_GHz * 1e9;
+const P_per_mode = B_ν * Δν * λ_emit * λ_emit;
+const P_directed = N_horns * P_per_mode * spectralConcentration;
+const P_directed_pulsed = P_directed * peakBrightnessFactor * p.dutyCycle; // average
+
+// Link budget
+const d_m = p.distance_km * 1000;
+const spotArea = Ω_beam * d_m * d_m;
+const captureFrac = Math.min(1, p.rxArea_m2 / spotArea);
+const P_rx = P_directed_pulsed * captureFrac;
+const N_noise = k_B * p.rxTemp_K * Δν;
+const SNR = P_rx / N_noise;
+const SNR_dB = 10 * Math.log10(Math.max(SNR, 1e-30));
+const switchRate = p.switchRate_kHz * 1000;
+const capacity_bps = switchRate * Math.log2(1 + Math.max(SNR, 0));
+
+// Directional export services
+const dirServices = [
+{ name: “Comms/Telemetry”, frac: 0.5, power: P_directed_pulsed * 0.5 },
+{ name: “Navigation Beacon”, frac: 0.2, power: P_directed_pulsed * 0.2 },
+{ name: “Ranging/Sync”, frac: 0.15, power: P_directed_pulsed * 0.15 },
+{ name: “Attitude Bias”, frac: 0.15, power: P_directed_pulsed * 0.15 },
+];
+
+// ── L5: FINAL DUMP ───────────────────────────────────────
+const P_final_dump = P_bulk_rad + (P_hot_segment - P_directed_pulsed);
+const q_bulk = p.emissivity * σ * (Math.pow(p.radTemp_K, 4) - Math.pow(p.sinkTemp_K, 4));
+const A_bulk = q_bulk > 0 ? P_final_dump / q_bulk : Infinity;
+const A_total = A_bulk + A_hot;
+const mass_radiator = A_total * p.radDensity_kgm2;
+
+// Final dump shaping
+const dumpServices = [
+{ name: “Neighbor Avoidance”, desc: “Shaped to avoid heating adjacent craft” },
+{ name: “Sensor Background”, desc: “Known emission for own sensor calibration” },
+{ name: “Health Telemetry”, desc: “Flow patterns encode system state” },
+];
+
+// ── SUMMARY ──────────────────────────────────────────────
+// Total value extracted before final dump
+const P_total_extracted = P_compute + P_survival + P_converted + P_directed_pulsed;
+const extraction_ratio = P_total_extracted / P_input;
+
+// Gradient utilization: how many services ride each drop
+const gradientCount = survivalServices.length + conversionServices.length + dirServices.length + dumpServices.length;
+
+return {
+P_input, P_compute, FLOPS, P_waste_L1, P_into_loop, P_path_loss,
+// L2
+P_survival, survivalServices, P_after_L2,
+// L3
+T_hot_loop, carnot_eff, conversion_eff, P_converted, P_conversion_waste,
+conversionServices, P_after_L3,
+// L4
+P_to_radiators, P_hot_segment, P_bulk_rad,
+T_emit, λ_emit: λ_emit * 1e6, ν_emit, spectralConcentration,
+A_hot, N_horns, Ω_beam, beamDiv_arcsec,
+T_pulse, peakBrightnessFactor, P_directed: P_directed_pulsed,
+P_rx, SNR, SNR_dB, capacity_bps,
+dirServices,
+// L5
+P_final_dump, A_bulk, A_total, mass_radiator, dumpServices,
+// Summary
+P_total_extracted, extraction_ratio, gradientCount,
+dutyCycle: p.dutyCycle,
+};
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UI
+// ═══════════════════════════════════════════════════════════════
+const fmt = (n, d = 1) => {
+if (!isFinite(n)) return “∞”;
+const a = Math.abs(n);
+if (a >= 1e15) return (n / 1e15).toFixed(d) + “P”;
+if (a >= 1e12) return (n / 1e12).toFixed(d) + “T”;
+if (a >= 1e9) return (n / 1e9).toFixed(d) + “G”;
+if (a >= 1e6) return (n / 1e6).toFixed(d) + “M”;
+if (a >= 1e3) return (n / 1e3).toFixed(d) + “k”;
+return n.toFixed(d);
+};
+const fmtB = b => {
+if (!isFinite(b) || b <= 0) return “0 bps”;
+if (b >= 1e9) return (b / 1e9).toFixed(1) + “ Gbps”;
+if (b >= 1e6) return (b / 1e6).toFixed(1) + “ Mbps”;
+if (b >= 1e3) return (b / 1e3).toFixed(1) + “ kbps”;
+return b.toFixed(0) + “ bps”;
+};
+const pct = (v) => (v * 100).toFixed(1) + “%”;
+
+function Sl({ k, label, unit, min, max, step, value, onChange, accent = “#00ccaa” }) {
+return (
+<div style={{ marginBottom: 8 }}>
+<div style={{ display: “flex”, justifyContent: “space-between”, marginBottom: 1 }}>
+<span style={{ fontSize: 9, color: “#5a7a8a” }}>{label}</span>
+<span style={{ fontSize: 9, color: accent, fontWeight: 600 }}>{value}{unit ? ` ${unit}` : “”}</span>
+</div>
+<input type=“range” min={min} max={max} step={step} value={value}
+onChange={e => onChange(k, parseFloat(e.target.value))}
+style={{ width: “100%”, height: 18, accentColor: accent, cursor: “pointer” }} />
+</div>
+);
+}
+
+// Cascade flow bar
+function FlowBar({ layers }) {
+const total = layers[0]?.power || 1;
+return (
+<div style={{ marginBottom: 12 }}>
+{/* Stacked horizontal bar */}
+<div style={{ display: “flex”, height: 24, borderRadius: 4, overflow: “hidden”, marginBottom: 4 }}>
+{layers.map((l, i) => {
+const w = Math.max(0.5, (l.power / total) * 100);
+return (
+<div key={i} style={{
+width: `${w}%`, background: l.color, minWidth: 1,
+display: “flex”, alignItems: “center”, justifyContent: “center”,
+transition: “width 0.3s”,
+}}>
+{w > 8 && <span style={{ fontSize: 7, color: “#0a0e14”, fontWeight: 700 }}>{l.label}</span>}
+</div>
+);
+})}
+</div>
+{/* Legend */}
+<div style={{ display: “flex”, flexWrap: “wrap”, gap: 6 }}>
+{layers.map((l, i) => (
+<div key={i} style={{ display: “flex”, alignItems: “center”, gap: 3 }}>
+<div style={{ width: 6, height: 6, borderRadius: 1, background: l.color }} />
+<span style={{ fontSize: 8, color: “#4a6a7a” }}>{l.label}: {fmt(l.power)}W ({pct(l.power / total)})</span>
+</div>
+))}
+</div>
+</div>
+);
+}
+
+// Layer detail card
+function LayerCard({ color, number, title, children }) {
+return (
+<div style={{
+background: “#0d1520”, border: `1px solid ${color}30`,
+borderRadius: 4, padding: “8px 10px”, marginBottom: 8,
+}}>
+<div style={{ display: “flex”, alignItems: “center”, gap: 6, marginBottom: 6 }}>
+<div style={{
+width: 18, height: 18, borderRadius: 3, background: `${color}20`,
+display: “flex”, alignItems: “center”, justifyContent: “center”,
+fontSize: 10, color, fontWeight: 700,
+}}>L{number}</div>
+<span style={{ fontSize: 10, color, fontWeight: 600, letterSpacing: 0.5 }}>{title}</span>
+</div>
+{children}
+</div>
+);
+}
+
+function ServiceList({ services, color }) {
+return (
+<div style={{ marginTop: 4 }}>
+{services.map((s, i) => (
+<div key={i} style={{ display: “flex”, justifyContent: “space-between”, fontSize: 9, padding: “2px 0”, borderBottom: “1px solid #0a0e1499” }}>
+<span style={{ color: “#5a7a8a” }}>{s.name}</span>
+<span style={{ color, fontWeight: 600 }}>{fmt(s.power)}W</span>
+</div>
+))}
+</div>
+);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DEFAULTS & SCENARIOS
+// ═══════════════════════════════════════════════════════════════
+const DEFAULTS = {
+computePower_kW: 500, efficiency: 0.35, computeDensity_GFLOPSW: 50,
+thermalPathEff: 0.95, survivalTapFrac: 0.08,
+hotLoopTemp_K: 500, conversionFrac: 0.1, conversionFracOfCarnot: 0.4,
+hotSegmentFrac: 0.06, hotSegmentTemp_K: 800,
+emissivity: 0.92, sinkTemp_K: 3, radTemp_K: 350, radDensity_kgm2: 5,
+hornAperture_m: 0.2, spectralEfficiency: 0.15,
+modBW_GHz: 10, dutyCycle: 0.2, switchRate_kHz: 2000,
+distance_km: 36000, rxArea_m2: 10, rxTemp_K: 50,
+};
+
+const SCENARIOS = {
+“LEO Cluster”: { …DEFAULTS, computePower_kW: 500, distance_km: 400, hotSegmentTemp_K: 600, switchRate_kHz: 5000, dutyCycle: 0.3 },
+“GEO Platform”: { …DEFAULTS, computePower_kW: 1000, distance_km: 36000, hotSegmentTemp_K: 800, conversionFrac: 0.12 },
+“Lunar DC”: { …DEFAULTS, computePower_kW: 200, sinkTemp_K: 280, radTemp_K: 400, hotSegmentTemp_K: 900, distance_km: 384400, rxArea_m2: 50, rxTemp_K: 20, survivalTapFrac: 0.15 },
+“L2 Observatory”: { …DEFAULTS, computePower_kW: 2000, sinkTemp_K: 3, hotSegmentTemp_K: 1000, distance_km: 1500000, rxArea_m2: 80, rxTemp_K: 10, conversionFrac: 0.08 },
+};
+
+const ALL_PARAMS = [
+{ key: “computePower_kW”, label: “Compute Power”, unit: “kW”, min: 10, max: 5000, step: 10, layer: 1 },
+{ key: “efficiency”, label: “Compute Efficiency”, unit: “”, min: 0.05, max: 0.95, step: 0.01, layer: 1 },
+{ key: “thermalPathEff”, label: “Thermal Path Eff”, unit: “”, min: 0.7, max: 0.99, step: 0.01, layer: 1 },
+{ key: “survivalTapFrac”, label: “Survival Tap”, unit: “”, min: 0, max: 0.3, step: 0.01, layer: 2 },
+{ key: “hotLoopTemp_K”, label: “Hot Loop Temp”, unit: “K”, min: 350, max: 800, step: 5, layer: 3 },
+{ key: “conversionFrac”, label: “Conversion Fraction”, unit: “”, min: 0, max: 0.3, step: 0.01, layer: 3 },
+{ key: “conversionFracOfCarnot”, label: “% of Carnot”, unit: “”, min: 0.1, max: 0.8, step: 0.01, layer: 3 },
+{ key: “hotSegmentFrac”, label: “Hot Segment Frac”, unit: “”, min: 0.01, max: 0.2, step: 0.01, layer: 4 },
+{ key: “hotSegmentTemp_K”, label: “Hot Segment Temp”, unit: “K”, min: 400, max: 1200, step: 10, layer: 4 },
+{ key: “spectralEfficiency”, label: “Spectral Shaping”, unit: “”, min: 0.01, max: 0.5, step: 0.01, layer: 4 },
+{ key: “hornAperture_m”, label: “Horn Aperture”, unit: “m”, min: 0.05, max: 1.0, step: 0.01, layer: 4 },
+{ key: “dutyCycle”, label: “Pulse Duty Cycle”, unit: “”, min: 0.05, max: 1.0, step: 0.01, layer: 4 },
+{ key: “switchRate_kHz”, label: “Switch Rate”, unit: “kHz”, min: 1, max: 10000, step: 1, layer: 4 },
+{ key: “modBW_GHz”, label: “Mod Bandwidth”, unit: “GHz”, min: 0.1, max: 100, step: 0.1, layer: 4 },
+{ key: “radTemp_K”, label: “Bulk Radiator Temp”, unit: “K”, min: 250, max: 500, step: 5, layer: 5 },
+{ key: “emissivity”, label: “Emissivity ε”, unit: “”, min: 0.5, max: 0.98, step: 0.01, layer: 5 },
+{ key: “sinkTemp_K”, label: “Sink Temp”, unit: “K”, min: 3, max: 380, step: 1, layer: 5 },
+{ key: “radDensity_kgm2”, label: “Rad Density”, unit: “kg/m²”, min: 1, max: 20, step: 0.5, layer: 5 },
+{ key: “distance_km”, label: “Link Distance”, unit: “km”, min: 400, max: 1500000, step: 100, layer: 4 },
+{ key: “rxArea_m2”, label: “Receiver Area”, unit: “m²”, min: 0.1, max: 100, step: 0.1, layer: 4 },
+{ key: “rxTemp_K”, label: “Receiver Temp”, unit: “K”, min: 4, max: 300, step: 1, layer: 4 },
+];
+
+const LAYER_COLORS = { 1: “#4488ff”, 2: “#ff8844”, 3: “#ffcc00”, 4: “#00ccaa”, 5: “#8866cc” };
+const LAYER_NAMES = { 1: “COMPUTE”, 2: “THERMAL WORK”, 3: “CONVERSION”, 4: “DIRECTIONAL”, 5: “FINAL DUMP” };
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════
+export default function ThermopylaeCascade() {
+const [params, setParams] = useState(SCENARIOS[“GEO Platform”]);
+const [tab, setTab] = useState(“cascade”);
+const [activeSc, setActiveSc] = useState(“GEO Platform”);
+const [expandedLayer, setExpandedLayer] = useState(null);
+const [sweepKey, setSweepKey] = useState(“hotSegmentTemp_K”);
+
+const setP = useCallback((k, v) => { setParams(p => ({ …p, [k]: v })); setActiveSc(null); }, []);
+const cas = useMemo(() => computeCascade(params), [params]);
+
+// Sweep
+const sweepDef = ALL_PARAMS.find(p => p.key === sweepKey) || ALL_PARAMS[0];
+const sweepData = useMemo(() => {
+const out = [];
+for (let i = 0; i <= 60; i++) {
+const v = sweepDef.min + (sweepDef.max - sweepDef.min) * (i / 60);
+const c = computeCascade({ …params, [sweepKey]: v });
+out.push({ x: v, extraction: c.extraction_ratio, capacity: c.capacity_bps, SNR_dB: c.SNR_dB });
+}
+return out;
+}, [params, sweepKey, sweepDef]);
+
+const tabBtn = (t, label) => (
+<button onClick={() => setTab(t)} style={{
+flex: 1, padding: “7px 0”, textAlign: “center”, fontSize: 9, fontWeight: 600,
+color: tab === t ? “#00ccaa” : “#3a5a6a”, background: tab === t ? “#00ccaa08” : “transparent”,
+border: “none”, borderBottom: `2px solid ${tab === t ? "#00ccaa" : "#1a2a3a"}`,
+cursor: “pointer”, fontFamily: “inherit”,
+}}>{label}</button>
+);
+
+// Mini chart
+function MC({ data, yKey, yLabel, color }) {
+const W = 300, H = 100, P = 28;
+const xs = data.map(d => d.x);
+const ys = data.map(d => { const v = d[yKey]; return isFinite(v) ? v : 0; });
+const xMn = Math.min(…xs), xMx = Math.max(…xs);
+const yMn = Math.min(…ys), yMx = Math.max(…ys);
+const sx = v => P + ((v - xMn) / (xMx - xMn || 1)) * (W - P * 2);
+const sy = v => H - P - ((v - yMn) / (yMx - yMn || 1)) * (H - P * 2);
+const pathD = data.map((d, i) => `${i === 0 ? "M" : "L"}${sx(d.x)},${sy(ys[i])}`).join(” “);
+const hIdx = data.reduce((b, d, i) => Math.abs(d.x - params[sweepKey]) < Math.abs(data[b].x - params[sweepKey]) ? i : b, 0);
+return (
+<svg viewBox={`0 0 ${W} ${H}`} style={{ width: “100%”, maxWidth: 340, height: “auto” }}>
+{[.25, .5, .75].map(f => <line key={f} x1={P} x2={W - P} y1={sy(yMn + f * (yMx - yMn))} y2={sy(yMn + f * (yMx - yMn))} stroke=”#1a2a3a” strokeWidth={0.5} />)}
+<path d={pathD} fill="none" stroke={color} strokeWidth={2} opacity={0.9} />
+<path d={pathD} fill="none" stroke={color} strokeWidth={5} opacity={0.1} />
+<circle cx={sx(data[hIdx].x)} cy={sy(ys[hIdx])} r={4} fill={color} />
+<text x={W / 2} y={H - 2} textAnchor=“middle” fill=”#5a7a8a” fontSize={7} fontFamily=“monospace”>{sweepDef.label}</text>
+<text x={3} y={H / 2} textAnchor=“middle” fill=”#5a7a8a” fontSize={7} fontFamily=“monospace” transform={`rotate(-90,3,${H / 2})`}>{yLabel}</text>
+</svg>
+);
+}
+
+return (
+<div style={{
+background: “#0a0e14”, color: “#c0d0d8”, minHeight: “100vh”,
+fontFamily: “‘JetBrains Mono’,‘Fira Code’,‘SF Mono’,monospace”,
+fontSize: 13, padding: “12px 10px”, maxWidth: 420, margin: “0 auto”,
+}}>
+{/* Header */}
+<div style={{ borderBottom: “1px solid #1a2a3a”, paddingBottom: 8, marginBottom: 10 }}>
+<div style={{ fontSize: 14, color: “#00ccaa”, fontWeight: 700, letterSpacing: 1.5 }}>THERMOPYLAE CASCADE</div>
+<div style={{ fontSize: 9, color: “#3a5a6a”, marginTop: 2 }}>
+No single-use gradients · Every ΔT carries a service
+</div>
+</div>
+
+```
+  {/* Scenarios */}
+  <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
+    {Object.keys(SCENARIOS).map(n => (
+      <button key={n} onClick={() => { setParams(SCENARIOS[n]); setActiveSc(n); }}
+        style={{
+          background: activeSc === n ? "#00ccaa12" : "#0d1520",
+          border: `1px solid ${activeSc === n ? "#00ccaa" : "#1a2a3a"}`,
+          color: activeSc === n ? "#00ccaa" : "#5a7a8a",
+          borderRadius: 4, padding: "3px 6px", fontSize: 9, cursor: "pointer", fontFamily: "inherit",
+        }}>{n}</button>
+    ))}
+  </div>
+
+  {/* Headline metric */}
+  <div style={{
+    background: "#0d1520", border: "1px solid #00ccaa30", borderRadius: 4,
+    padding: "8px 10px", marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center",
+  }}>
+    <div>
+      <div style={{ fontSize: 8, color: "#3a5a6a", letterSpacing: 0.5 }}>GRADIENT UTILIZATION</div>
+      <div style={{ fontSize: 22, color: "#00ffaa", fontWeight: 700 }}>{pct(cas.extraction_ratio)}</div>
+      <div style={{ fontSize: 8, color: "#4a6a7a" }}>of input extracted before final dump</div>
+    </div>
+    <div style={{ textAlign: "right" }}>
+      <div style={{ fontSize: 8, color: "#3a5a6a" }}>SERVICES</div>
+      <div style={{ fontSize: 18, color: "#ffaa44", fontWeight: 700 }}>{cas.gradientCount}</div>
+      <div style={{ fontSize: 8, color: "#4a6a7a" }}>piggyback functions</div>
+    </div>
+  </div>
+
+  {/* Tabs */}
+  <div style={{ display: "flex", marginBottom: 10 }}>
+    {tabBtn("cascade", "CASCADE")}
+    {tabBtn("tune", "TUNE")}
+    {tabBtn("sweep", "SWEEP")}
+    {tabBtn("eco", "ECOSYSTEM")}
+  </div>
+
+  {/* ─── CASCADE ─── */}
+  {tab === "cascade" && <>
+    <FlowBar layers={[
+      { label: "INPUT", power: cas.P_input, color: "#ffffff" },
+      { label: "COMPUTE", power: cas.P_compute, color: LAYER_COLORS[1] },
+      { label: "SURV", power: cas.P_survival, color: LAYER_COLORS[2] },
+      { label: "CONV", power: cas.P_converted, color: LAYER_COLORS[3] },
+      { label: "DIR", power: cas.P_directed, color: LAYER_COLORS[4] },
+      { label: "DUMP", power: cas.P_final_dump, color: LAYER_COLORS[5] },
+    ]} />
+
+    <LayerCard color={LAYER_COLORS[1]} number={1} title="COMPUTE">
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10 }}>
+        <span style={{ color: "#5a7a8a" }}>Useful: {fmt(cas.P_compute)}W → {fmt(cas.FLOPS)}FLOPS</span>
+        <span style={{ color: "#ff6644" }}>Waste: {fmt(cas.P_waste_L1)}W</span>
+      </div>
+      <div style={{ fontSize: 9, color: "#4a6a7a", marginTop: 3 }}>
+        Path loss: {fmt(cas.P_path_loss)}W ({pct(cas.P_path_loss / cas.P_waste_L1)}) — co-locate hot jobs near loop taps
+      </div>
+    </LayerCard>
+
+    <LayerCard color={LAYER_COLORS[2]} number={2} title="INTERNAL THERMAL WORK">
+      <div style={{ fontSize: 10, color: "#5a7a8a", marginBottom: 3 }}>
+        Tapped: {fmt(cas.P_survival)}W ({pct(cas.survivalTapFrac)}) — survival heaters are loop taps
+      </div>
+      <ServiceList services={cas.survivalServices} color={LAYER_COLORS[2]} />
+    </LayerCard>
+
+    <LayerCard color={LAYER_COLORS[3]} number={3} title="HIGH-VALUE CONVERSION">
+      <div style={{ fontSize: 10, color: "#5a7a8a", marginBottom: 3 }}>
+        TPV/TE at {cas.T_hot_loop}K → {cas.radTemp_K}K: η_Carnot={pct(cas.carnot_eff)}, actual={pct(cas.conversion_eff)}
+      </div>
+      <div style={{ fontSize: 10, color: LAYER_COLORS[3], fontWeight: 600, marginBottom: 3 }}>
+        Recovered: {fmt(cas.P_converted)}W electrical
+      </div>
+      <ServiceList services={cas.conversionServices} color={LAYER_COLORS[3]} />
+    </LayerCard>
+
+    <LayerCard color={LAYER_COLORS[4]} number={4} title="DIRECTIONAL EXPORT (HOT GATES)">
+      <div style={{ fontSize: 10, color: "#5a7a8a", marginBottom: 3 }}>
+        {cas.N_horns} horns × {params.hornAperture_m}m @ {cas.T_emit}K → λ={cas.λ_emit.toFixed(1)}μm
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 4 }}>
+        {[
+          { l: "Beam", v: cas.beamDiv_arcsec.toFixed(1) + "″" },
+          { l: "Pulse T", v: cas.T_pulse.toFixed(0) + "K" },
+          { l: "SNR", v: cas.SNR_dB.toFixed(0) + "dB" },
+        ].map(({ l, v }) => (
+          <div key={l} style={{ background: "#0a0e14", borderRadius: 3, padding: "3px 5px", textAlign: "center" }}>
+            <div style={{ fontSize: 7, color: "#3a5a6a" }}>{l}</div>
+            <div style={{ fontSize: 11, color: LAYER_COLORS[4], fontWeight: 600 }}>{v}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ fontSize: 11, color: "#00ffaa", fontWeight: 700, textAlign: "center", marginBottom: 4 }}>
+        {fmtB(cas.capacity_bps)}
+      </div>
+      <ServiceList services={cas.dirServices} color={LAYER_COLORS[4]} />
+    </LayerCard>
+
+    <LayerCard color={LAYER_COLORS[5]} number={5} title="FINAL DUMP">
+      <div style={{ fontSize: 10, color: "#5a7a8a" }}>
+        {fmt(cas.P_final_dump)}W → {fmt(cas.A_bulk, 0)}m² bulk + {fmt(cas.A_hot, 0)}m² hot = {fmt(cas.A_total, 0)}m² total ({fmt(cas.mass_radiator, 0)}kg)
+      </div>
+      <div style={{ marginTop: 4 }}>
+        {cas.dumpServices.map((s, i) => (
+          <div key={i} style={{ fontSize: 9, color: "#4a6a7a", padding: "2px 0" }}>
+            <span style={{ color: LAYER_COLORS[5] }}>{s.name}:</span> {s.desc}
+          </div>
+        ))}
+      </div>
+    </LayerCard>
+  </>}
+
+  {/* ─── TUNE ─── */}
+  {tab === "tune" && <>
+    {[1, 2, 3, 4, 5].map(layer => {
+      const lParams = ALL_PARAMS.filter(p => p.layer === layer);
+      const isExp = expandedLayer === layer;
+      return (
+        <div key={layer} style={{ marginBottom: 6 }}>
+          <button onClick={() => setExpandedLayer(isExp ? null : layer)}
+            style={{
+              width: "100%", display: "flex", alignItems: "center", gap: 6,
+              background: "#0d1520", border: `1px solid ${LAYER_COLORS[layer]}30`,
+              borderRadius: 4, padding: "6px 8px", cursor: "pointer", fontFamily: "inherit",
+            }}>
+            <div style={{
+              width: 16, height: 16, borderRadius: 3, background: `${LAYER_COLORS[layer]}20`,
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 9, color: LAYER_COLORS[layer], fontWeight: 700,
+            }}>L{layer}</div>
+            <span style={{ fontSize: 10, color: LAYER_COLORS[layer], fontWeight: 600, flex: 1, textAlign: "left" }}>
+              {LAYER_NAMES[layer]}
+            </span>
+            <span style={{ fontSize: 10, color: "#3a5a6a" }}>{isExp ? "▲" : "▼"}</span>
+          </button>
+          {isExp && (
+            <div style={{ padding: "8px 4px" }}>
+              {lParams.map(p => (
+                <Sl key={p.key} {...p} value={params[p.key]} onChange={setP} accent={LAYER_COLORS[layer]} />
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    })}
+  </>}
+
+  {/* ─── SWEEP ─── */}
+  {tab === "sweep" && <>
+    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+      <span style={{ fontSize: 8, color: "#3a5a6a" }}>PARAM:</span>
+      <select value={sweepKey} onChange={e => setSweepKey(e.target.value)}
+        style={{ background: "#0d1520", border: "1px solid #1a2a3a", color: "#00ccaa", borderRadius: 4, padding: "3px 5px", fontSize: 9, fontFamily: "inherit", flex: 1 }}>
+        {ALL_PARAMS.map(p => <option key={p.key} value={p.key}>L{p.layer}: {p.label}</option>)}
+      </select>
+    </div>
+    <MC data={sweepData} yKey="extraction" yLabel="Extraction %" color="#00ffaa" />
+    <MC data={sweepData} yKey="capacity" yLabel="Capacity bps" color="#00ccaa" />
+    <MC data={sweepData} yKey="SNR_dB" yLabel="SNR dB" color="#ffaa44" />
+    <div style={{ marginTop: 8 }}>
+      <Sl {...sweepDef} value={params[sweepKey]} onChange={setP} accent={LAYER_COLORS[sweepDef.layer]} />
+    </div>
+  </>}
+
+  {/* ─── ECOSYSTEM ─── */}
+  {tab === "eco" && <>
+    <div style={{
+      background: "#0d1520", border: "1px solid #00ccaa20", borderRadius: 4,
+      padding: "10px", marginBottom: 10,
+    }}>
+      <div style={{ fontSize: 10, color: "#00ccaa", fontWeight: 700, marginBottom: 8, letterSpacing: 0.5 }}>
+        DESIGN PRINCIPLES
+      </div>
+      {[
+        { icon: "∅", title: "No Single-Use Gradients", desc: `Every ΔT drop has ${cas.gradientCount} piggyback services. Current extraction: ${pct(cas.extraction_ratio)} before dump.`, color: "#00ccaa" },
+        { icon: "≈", title: "Match Scales", desc: `Bulk rad (${fmt(cas.A_total, 0)}m², slow) → survival. Hot gates (${cas.N_horns} horns, fast) → signaling.`, color: "#ffaa44" },
+        { icon: "○", title: "Local Closure", desc: `Survival tap (${pct(cas.survivalTapFrac)}) keeps heat local. ${fmt(cas.P_survival)}W never reaches global sink.`, color: "#ff8844" },
+        { icon: "i", title: "Information from Waste", desc: `Thermal maze = sensor network. Flow patterns encode health, workload, environment.`, color: "#4488ff" },
+      ].map(({ icon, title, desc, color: c }, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+          <div style={{
+            width: 24, height: 24, borderRadius: 4, background: `${c}15`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 14, color: c, fontWeight: 700, flexShrink: 0,
+          }}>{icon}</div>
+          <div>
+            <div style={{ fontSize: 10, color: c, fontWeight: 600 }}>{title}</div>
+            <div style={{ fontSize: 9, color: "#5a7a8a", lineHeight: 1.5 }}>{desc}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+
+    {/* Node classification */}
+    <div style={{
+      background: "#0d1520", border: "1px solid #1a2a3a", borderRadius: 4,
+      padding: "10px", marginBottom: 10,
+    }}>
+      <div style={{ fontSize: 10, color: "#ffaa44", fontWeight: 700, marginBottom: 6 }}>
+        NODE CLASSIFICATION
+      </div>
+      {[
+        { type: "Endotherm", desc: "Burns excess to stabilize neighbors. Hot segment nodes — run hotter deliberately, export structured energy.", color: "#ff6644", pct: pct(cas.hotSegmentFrac) },
+        { type: "Ectotherm", desc: "Rides ambient heat from neighbors. Bulk compute — takes whatever thermal environment it gets.", color: "#4488ff", pct: pct(1 - cas.hotSegmentFrac - cas.conversionFrac) },
+        { type: "Converter", desc: "Transforms gradient type (thermal→electrical). TPV/TE modules at high-ΔT junctions.", color: "#ffcc00", pct: pct(cas.conversionFrac) },
+      ].map(({ type, desc, color: cl, pct: p }, i) => (
+        <div key={i} style={{ marginBottom: 6, display: "flex", gap: 8 }}>
+          <div style={{
+            width: 40, textAlign: "center", flexShrink: 0,
+            fontSize: 14, fontWeight: 700, color: cl,
+          }}>{p}</div>
+          <div>
+            <div style={{ fontSize: 10, color: cl, fontWeight: 600 }}>{type}</div>
+            <div style={{ fontSize: 9, color: "#4a6a7a", lineHeight: 1.4 }}>{desc}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+
+    {/* Next layers */}
+    <div style={{
+      background: "#00ccaa06", border: "1px solid #00ccaa15", borderRadius: 4,
+      padding: "8px 10px", fontSize: 9, color: "#5a8a7a", lineHeight: 1.6,
+    }}>
+      <b style={{ color: "#00ccaa" }}>NEXT ITERATION: </b>
+      Compute scheduling as thermo-economic planner — jobs placed to optimize latency AND
+      useful thermal gradient generation. Pre-heat a tank before maneuver by scheduling
+      heavy compute on adjacent nodes. The scheduler sees the thermal graph, not just the
+      compute graph.
+    </div>
+  </>}
+
+  <div style={{ fontSize: 7, color: "#1a2a3a", textAlign: "center", padding: 10 }}>
+    Planck · Stefan-Boltzmann · Shannon-Hartley · Carnot · Wien
+  </div>
+</div>
+```
+
+);
+}
