@@ -1,0 +1,617 @@
+import { useState, useMemo, useCallback } from “react”;
+
+// ═══════════════════════════════════════════════════════════════
+// CONSTANTS & PHYSICS
+// ═══════════════════════════════════════════════════════════════
+const σ = 5.670374419e-8;
+const k_B = 1.380649e-23;
+const h_p = 6.62607015e-34;
+const c = 2.998e8;
+
+// ═══════════════════════════════════════════════════════════════
+// PLATFORM ENGINE — 4-stage joule lifecycle
+// ═══════════════════════════════════════════════════════════════
+function computePlatform(p) {
+const P_in = p.totalPower_kW * 1000;
+const N = p.numNodes;
+const P_per_node = P_in / N;
+
+// ━━━ STAGE 1: COMPUTE + LOCAL THERMAL WORK ━━━━━━━━━━━━━━
+const P_compute = P_in * p.computeEff;
+const P_waste = P_in * (1 - p.computeEff);
+const P_per_node_waste = P_waste / N;
+
+// Reuse 1a: Phase-change store → eclipse survival
+const eclipseHeaterReplaced_W = p.eclipseHeaterPerNode_W * N;
+// PCM capacity: paraffin ~200 kJ/kg
+const eclipseDuration_s = p.eclipseDuration_min * 60;
+const pcmMassNeeded_kg = (eclipseHeaterReplaced_W * eclipseDuration_s) / (p.pcmLatentHeat_kJkg * 1000);
+
+// Reuse 1b: Thermal health monitoring (value, not power)
+const healthMonitorNodes = N; // each node self-diagnosing
+
+const P_after_S1 = P_waste; // all waste heat enters cluster bus
+const S1_reuse_W = eclipseHeaterReplaced_W;
+
+// ━━━ STAGE 2: CLUSTER THERMAL BUS ━━━━━━━━━━━━━━━━━━━━━━
+// Reuse 2a: Propellant depot warming
+const P_prop_heating = p.propHeating_kW * 1000;
+
+// Reuse 2b: High-T stage → TPV conversion
+const P_to_highT = p.tpvInputPower_kW * 1000;
+const T_highT = p.tpvBlockTemp_K;
+// TPV at ~1.55μm, efficiency depends on temp
+const tpvEff = p.tpvEfficiency;
+const P_tpv_electric = P_to_highT * tpvEff;
+const P_tpv_waste = P_to_highT * (1 - tpvEff);
+
+// TPV electric feeds: beacon + thruster valves
+const P_beacon_from_tpv = P_tpv_electric * 0.6;
+const P_valves_from_tpv = P_tpv_electric * 0.4;
+
+// Reuse 2c: Attitude louvers (thermal actuators)
+const P_attitude_thermal = p.attitudeLouver_W;
+const attitudeRate_deghr = p.attitudeRate_deghr;
+
+const P_after_S2 = P_after_S1 - P_prop_heating - P_to_highT - P_attitude_thermal;
+const S2_reuse_W = P_prop_heating + P_tpv_electric + P_attitude_thermal;
+
+// ━━━ STAGE 3: RADIATOR + STRUCTURED EXPORT ━━━━━━━━━━━━━
+const P_to_radiators = Math.max(0, P_after_S2 + P_tpv_waste);
+const numTiles = p.numTiles;
+const tileArea_m2 = p.tileArea_m2;
+const A_total = numTiles * tileArea_m2;
+
+// Hot gates: 10% of tile area
+const hotGateFrac = p.hotGateFrac;
+const A_hotgates = A_total * hotGateFrac;
+const A_bulk = A_total * (1 - hotGateFrac);
+
+// Hot gate beam properties
+const T_rad = p.radTemp_K;
+const λ_peak = 2.898e-3 / T_rad;
+const troughLength_m = p.troughLength_m;
+const coneAngle_deg = p.coneAngle_deg;
+const coneAngle_rad = coneAngle_deg * Math.PI / 180;
+
+// Power per tile into directed cone
+const q_rad = p.emissivity * σ * (Math.pow(T_rad, 4) - Math.pow(p.sinkTemp_K, 4));
+const P_per_tile_total = q_rad * tileArea_m2;
+const P_per_tile_hotgate = q_rad * tileArea_m2 * hotGateFrac;
+// Geometric concentration: horn narrows from 2π to cone
+const Ω_cone = 2 * Math.PI * (1 - Math.cos(coneAngle_rad));
+const geomGain = (2 * Math.PI) / Ω_cone;
+const P_per_tile_directed = P_per_tile_hotgate; // same power, narrower beam
+const P_beacon_total = P_per_tile_directed * numTiles * p.beaconModEff;
+
+// Beacon data rate
+const beaconBitrate_bps = p.beaconBitrate_bps;
+
+// Reuse 3b: Tile-edge thermal diodes → diagnostics
+const diagnosticTiles = numTiles;
+
+// Reuse 3c: Docking radiator utility
+const dockingTiles = p.dockingTiles;
+const dockingCapacity_W = dockingTiles * P_per_tile_total;
+
+const S3_reuse_W = P_beacon_total + dockingCapacity_W;
+
+// ━━━ STAGE 4: FINAL ENTROPY DUMP ━━━━━━━━━━━━━━━━━━━━━━━
+const P_final_dump = P_to_radiators - P_beacon_total;
+const A_dump = A_bulk;
+// Edge shields reduce albedo reflection
+const albedoReduction_pct = p.edgeShieldEff * 100;
+
+// Calibration source utility
+const calSourcePower = P_final_dump; // known signature
+
+// ━━━ TOTALS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const totalReuse_W = S1_reuse_W + S2_reuse_W + S3_reuse_W;
+const reuseRatio = totalReuse_W / P_waste;
+const servicesPerJoule = (
+(S1_reuse_W > 0 ? 2 : 0) + // eclipse + health
+(S2_reuse_W > 0 ? 3 : 0) + // prop + TPV + attitude
+(S3_reuse_W > 0 ? 3 : 0) + // beacon + diag + docking
+1 // cal source
+);
+
+// ━━━ 1MW SCALING WALL ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const P_MW = p.totalPower_kW / 1000; // in MW
+const scalingIssues = [];
+if (P_in > 200000) scalingIssues.push({ issue: “Two-phase flow required”, severity: “critical”, detail: “Single-phase loop pressure drop exceeds pump limits” });
+if (P_in > 300000) scalingIssues.push({ issue: “Active gate coherence”, severity: “critical”, detail: “Passive geometry can’t maintain beam quality at this scale” });
+if (P_in > 150000) scalingIssues.push({ issue: “Thermal customer exhaustion”, severity: “warning”, detail: “Onboard reuse saturates — excess heat has no secondary use” });
+if (A_total > 2000) scalingIssues.push({ issue: “Structural mass”, severity: “warning”, detail: “Radiator array exceeds single-vehicle deployment limits” });
+if (P_in > 500000) scalingIssues.push({ issue: “Distribute or die”, severity: “critical”, detail: “Must split across multiple vehicles — swarm architecture required” });
+
+// Reuse saturation: what fraction of waste has a customer?
+const reuseSaturation = Math.min(1, totalReuse_W / P_waste);
+// At higher power, customers don’t scale
+const projectedSaturation_1MW = Math.min(1, totalReuse_W / (1e6 * (1 - p.computeEff)));
+
+return {
+P_in, N, P_compute, P_waste, P_per_node_waste,
+// S1
+eclipseHeaterReplaced_W, pcmMassNeeded_kg, healthMonitorNodes,
+S1_reuse_W, P_after_S1,
+// S2
+P_prop_heating, P_to_highT, T_highT, tpvEff,
+P_tpv_electric, P_beacon_from_tpv, P_valves_from_tpv,
+P_attitude_thermal, attitudeRate_deghr,
+S2_reuse_W, P_after_S2,
+// S3
+P_to_radiators, numTiles, tileArea_m2, A_total,
+A_hotgates, A_bulk, T_rad, λ_peak: λ_peak * 1e6,
+geomGain, P_beacon_total, beaconBitrate_bps,
+dockingCapacity_W, diagnosticTiles,
+S3_reuse_W,
+// S4
+P_final_dump, A_dump, albedoReduction_pct, calSourcePower,
+// Totals
+totalReuse_W, reuseRatio, servicesPerJoule,
+mass_radiator: A_total * p.radDensity_kgm2,
+// Scaling
+scalingIssues, reuseSaturation, projectedSaturation_1MW,
+};
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DEFAULTS
+// ═══════════════════════════════════════════════════════════════
+const DEFAULTS = {
+totalPower_kW: 100, numNodes: 10, computeEff: 0.15,
+// S1
+eclipseHeaterPerNode_W: 50, eclipseDuration_min: 30,
+pcmLatentHeat_kJkg: 200,
+// S2
+propHeating_kW: 2, tpvInputPower_kW: 5, tpvBlockTemp_K: 550,
+tpvEfficiency: 0.15, attitudeLouver_W: 200, attitudeRate_deghr: 1.5,
+// S3
+numTiles: 20, tileArea_m2: 25, hotGateFrac: 0.10,
+radTemp_K: 335, emissivity: 0.92, sinkTemp_K: 3,
+troughLength_m: 1.0, coneAngle_deg: 15,
+beaconModEff: 0.02, beaconBitrate_bps: 100,
+dockingTiles: 4, radDensity_kgm2: 5,
+// S4
+edgeShieldEff: 0.85,
+};
+
+const SCENARIOS = {
+“100kW SSO”: { …DEFAULTS },
+“200kW Higher Eff”: { …DEFAULTS, totalPower_kW: 200, computeEff: 0.20, numTiles: 30, tpvInputPower_kW: 8 },
+“50kW Compact”: { …DEFAULTS, totalPower_kW: 50, numNodes: 5, numTiles: 12, tileArea_m2: 20, tpvInputPower_kW: 2.5, propHeating_kW: 1 },
+“500kW Scaling”: { …DEFAULTS, totalPower_kW: 500, numNodes: 20, numTiles: 60, tpvInputPower_kW: 15, propHeating_kW: 5 },
+“1MW Wall”: { …DEFAULTS, totalPower_kW: 1000, numNodes: 40, numTiles: 100, tpvInputPower_kW: 20, propHeating_kW: 8 },
+};
+
+// ═══════════════════════════════════════════════════════════════
+// UI HELPERS
+// ═══════════════════════════════════════════════════════════════
+const fmt = (n, d = 1) => {
+if (!isFinite(n)) return “∞”;
+const a = Math.abs(n);
+if (a >= 1e6) return (n / 1e6).toFixed(d) + “M”;
+if (a >= 1e3) return (n / 1e3).toFixed(d) + “k”;
+if (a < 0.01 && a > 0) return (n * 1000).toFixed(d) + “m”;
+return n.toFixed(d);
+};
+const pct = v => (v * 100).toFixed(1) + “%”;
+const fW = w => {
+if (w >= 1e6) return (w / 1e6).toFixed(1) + “ MW”;
+if (w >= 1e3) return (w / 1e3).toFixed(1) + “ kW”;
+if (w >= 1) return w.toFixed(1) + “ W”;
+return (w * 1000).toFixed(0) + “ mW”;
+};
+
+function Sl({ k, label, unit, min, max, step, value, onChange, accent = “#00ccaa” }) {
+return (
+<div style={{ marginBottom: 7 }}>
+<div style={{ display: “flex”, justifyContent: “space-between”, marginBottom: 1 }}>
+<span style={{ fontSize: 9, color: “#5a7a8a” }}>{label}</span>
+<span style={{ fontSize: 9, color: accent, fontWeight: 600 }}>
+{typeof value === ‘number’ ? (Number.isInteger(step) && step >= 1 ? value : value.toFixed(2)) : value}{unit ? ` ${unit}` : “”}
+</span>
+</div>
+<input type=“range” min={min} max={max} step={step} value={value}
+onChange={e => onChange(k, parseFloat(e.target.value))}
+style={{ width: “100%”, height: 18, accentColor: accent, cursor: “pointer” }} />
+</div>
+);
+}
+
+// Sankey-ish horizontal flow
+function JouleFlow({ stages }) {
+const total = stages[0]?.input || 1;
+return (
+<div style={{ marginBottom: 10 }}>
+{stages.map((s, i) => {
+const inputW = (s.input / total) * 100;
+const reuseW = (s.reuse / total) * 100;
+const passW = inputW - reuseW;
+return (
+<div key={i} style={{ marginBottom: 3 }}>
+<div style={{ display: “flex”, alignItems: “center”, gap: 4, marginBottom: 2 }}>
+<div style={{
+width: 14, height: 14, borderRadius: 2, background: `${s.color}25`,
+display: “flex”, alignItems: “center”, justifyContent: “center”,
+fontSize: 8, color: s.color, fontWeight: 700,
+}}>S{i + 1}</div>
+<span style={{ fontSize: 8, color: s.color, fontWeight: 600, flex: 1 }}>{s.label}</span>
+<span style={{ fontSize: 8, color: “#4a6a7a” }}>{fW(s.reuse)} extracted</span>
+</div>
+<div style={{ display: “flex”, height: 10, borderRadius: 2, overflow: “hidden”, background: “#0a0e14” }}>
+<div style={{
+width: `${Math.max(0.5, reuseW)}%`,
+background: `linear-gradient(90deg, ${s.color}60, ${s.color})`,
+transition: “width 0.3s”,
+}} />
+<div style={{
+width: `${Math.max(0.5, passW)}%`,
+background: `${s.color}15`,
+transition: “width 0.3s”,
+}} />
+</div>
+</div>
+);
+})}
+</div>
+);
+}
+
+// Service list
+function SvcRow({ name, value, detail, color }) {
+return (
+<div style={{ display: “flex”, justifyContent: “space-between”, alignItems: “baseline”, fontSize: 9, padding: “3px 0”, borderBottom: “1px solid #0a0e1488” }}>
+<div>
+<span style={{ color: “#5a7a8a” }}>{name}</span>
+{detail && <span style={{ color: “#3a4a5a”, fontSize: 8, marginLeft: 4 }}>{detail}</span>}
+</div>
+<span style={{ color, fontWeight: 600 }}>{value}</span>
+</div>
+);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════
+export default function Platform100kW() {
+const [params, setParams] = useState(SCENARIOS[“100kW SSO”]);
+const [tab, setTab] = useState(“joule”);
+const [activeSc, setActiveSc] = useState(“100kW SSO”);
+const [expandSt, setExpandSt] = useState(null);
+
+const setP = useCallback((k, v) => { setParams(p => ({ …p, [k]: v })); setActiveSc(null); }, []);
+const plat = useMemo(() => computePlatform(params), [params]);
+
+const tabBtn = (t, label) => (
+<button onClick={() => setTab(t)} style={{
+flex: 1, padding: “6px 0”, textAlign: “center”, fontSize: 9, fontWeight: 600,
+color: tab === t ? “#00ccaa” : “#3a5a6a”, background: tab === t ? “#00ccaa08” : “transparent”,
+border: “none”, borderBottom: `2px solid ${tab === t ? "#00ccaa" : "#1a2a3a"}`,
+cursor: “pointer”, fontFamily: “inherit”,
+}}>{label}</button>
+);
+
+const SC = { 1: “#4488ff”, 2: “#ff8844”, 3: “#00ccaa”, 4: “#8866cc” };
+
+return (
+<div style={{
+background: “#0a0e14”, color: “#c0d0d8”, minHeight: “100vh”,
+fontFamily: “‘JetBrains Mono’,‘Fira Code’,‘SF Mono’,monospace”,
+fontSize: 13, padding: “12px 10px”, maxWidth: 420, margin: “0 auto”,
+}}>
+{/* Header */}
+<div style={{ borderBottom: “1px solid #1a2a3a”, paddingBottom: 8, marginBottom: 10 }}>
+<div style={{ fontSize: 13, color: “#00ccaa”, fontWeight: 700, letterSpacing: 1.5 }}>
+THERMOPYLAE PLATFORM
+</div>
+<div style={{ fontSize: 9, color: “#3a5a6a”, marginTop: 2 }}>
+{params.totalPower_kW}kW · {params.numNodes} nodes · {plat.A_total}m² · SSO LEO
+</div>
+</div>
+
+```
+  {/* Scenarios */}
+  <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
+    {Object.keys(SCENARIOS).map(n => (
+      <button key={n} onClick={() => { setParams(SCENARIOS[n]); setActiveSc(n); }}
+        style={{
+          background: activeSc === n ? "#00ccaa12" : "#0d1520",
+          border: `1px solid ${activeSc === n ? "#00ccaa" : "#1a2a3a"}`,
+          color: activeSc === n ? "#00ccaa" : "#5a7a8a",
+          borderRadius: 4, padding: "3px 6px", fontSize: 8, cursor: "pointer", fontFamily: "inherit",
+        }}>{n}</button>
+    ))}
+  </div>
+
+  {/* Headlines */}
+  <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+    <div style={{
+      flex: 1, background: "#0d1520", border: "1px solid #00ccaa30", borderRadius: 4, padding: "6px 8px", textAlign: "center",
+    }}>
+      <div style={{ fontSize: 7, color: "#3a5a6a", letterSpacing: 0.5 }}>REUSE EXTRACTED</div>
+      <div style={{ fontSize: 20, color: "#00ffaa", fontWeight: 700 }}>{fW(plat.totalReuse_W)}</div>
+      <div style={{ fontSize: 8, color: "#4a6a7a" }}>{pct(plat.reuseRatio)} of waste</div>
+    </div>
+    <div style={{
+      flex: 1, background: "#0d1520", border: "1px solid #ffaa4430", borderRadius: 4, padding: "6px 8px", textAlign: "center",
+    }}>
+      <div style={{ fontSize: 7, color: "#3a5a6a", letterSpacing: 0.5 }}>SERVICES / JOULE</div>
+      <div style={{ fontSize: 20, color: "#ffaa44", fontWeight: 700 }}>{plat.servicesPerJoule}</div>
+      <div style={{ fontSize: 8, color: "#4a6a7a" }}>before final dump</div>
+    </div>
+  </div>
+
+  {/* Tabs */}
+  <div style={{ display: "flex", marginBottom: 10 }}>
+    {tabBtn("joule", "JOULE PATH")}
+    {tabBtn("tune", "TUNE")}
+    {tabBtn("scale", "SCALING")}
+    {tabBtn("swarm", "SWARM")}
+  </div>
+
+  {/* ━━━ JOULE PATH ━━━ */}
+  {tab === "joule" && <>
+    <JouleFlow stages={[
+      { label: "COMPUTE + LOCAL", input: plat.P_waste, reuse: plat.S1_reuse_W, color: SC[1] },
+      { label: "CLUSTER BUS", input: plat.P_after_S1, reuse: plat.S2_reuse_W, color: SC[2] },
+      { label: "RADIATOR + EXPORT", input: plat.P_to_radiators, reuse: plat.S3_reuse_W, color: SC[3] },
+      { label: "ENTROPY DUMP", input: plat.P_final_dump, reuse: 0, color: SC[4] },
+    ]} />
+
+    {/* Stage details — collapsible */}
+    {[
+      { n: 1, title: "COMPUTE + LOCAL THERMAL", color: SC[1], content: (
+        <>
+          <SvcRow name="Waste heat total" value={fW(plat.P_waste)} color={SC[1]} />
+          <SvcRow name="Eclipse heater replacement" value={fW(plat.eclipseHeaterReplaced_W)}
+            detail={`${params.eclipseHeaterPerNode_W}W × ${plat.N} nodes`} color={SC[1]} />
+          <SvcRow name="PCM mass needed" value={plat.pcmMassNeeded_kg.toFixed(1) + " kg"}
+            detail={`${params.eclipseDuration_min}min eclipse`} color="#5a7a8a" />
+          <SvcRow name="Health monitoring" value={plat.healthMonitorNodes + " nodes"}
+            detail="thermal transient fault detection" color="#5a7a8a" />
+        </>
+      )},
+      { n: 2, title: "CLUSTER THERMAL BUS", color: SC[2], content: (
+        <>
+          <SvcRow name="Propellant heating" value={fW(plat.P_prop_heating)}
+            detail="Xe/N₂ above sublimation" color={SC[2]} />
+          <SvcRow name="TPV input" value={fW(plat.P_to_highT)}
+            detail={`${plat.T_highT}K block → ${pct(plat.tpvEff)} eff`} color={SC[2]} />
+          <SvcRow name="TPV electric output" value={fW(plat.P_tpv_electric)} color="#ffcc00" />
+          <SvcRow name="  → IR beacon power" value={fW(plat.P_beacon_from_tpv)} color="#ffcc00" />
+          <SvcRow name="  → Thruster valves" value={fW(plat.P_valves_from_tpv)} color="#ffcc00" />
+          <SvcRow name="Attitude louvers" value={fW(plat.P_attitude_thermal)}
+            detail={`${plat.attitudeRate_deghr}°/hr thermal bias`} color={SC[2]} />
+        </>
+      )},
+      { n: 3, title: "RADIATOR + STRUCTURED EXPORT", color: SC[3], content: (
+        <>
+          <SvcRow name="Total radiator area" value={plat.A_total + " m²"}
+            detail={`${plat.numTiles} tiles × ${params.tileArea_m2}m²`} color={SC[3]} />
+          <SvcRow name="Hot gate area" value={plat.A_hotgates.toFixed(0) + " m²"}
+            detail={`${(params.hotGateFrac * 100).toFixed(0)}% of tiles`} color={SC[3]} />
+          <SvcRow name="λ peak" value={plat.λ_peak.toFixed(1) + " μm"}
+            detail={`@ ${plat.T_rad}K`} color="#5a7a8a" />
+          <SvcRow name="Geometric gain" value={plat.geomGain.toFixed(1) + "×"}
+            detail={`${params.coneAngle_deg}° cone`} color={SC[3]} />
+          <SvcRow name="Beacon power (total)" value={fW(plat.P_beacon_total)}
+            detail={`${params.beaconBitrate_bps} bps nav data`} color={SC[3]} />
+          <SvcRow name="Docking capacity" value={fW(plat.dockingCapacity_W)}
+            detail={`${params.dockingTiles} tiles for visiting craft`} color={SC[3]} />
+          <SvcRow name="Diagnostic tiles" value={plat.diagnosticTiles + " active"}
+            detail="gradient uniformity monitoring" color="#5a7a8a" />
+        </>
+      )},
+      { n: 4, title: "FINAL ENTROPY DUMP", color: SC[4], content: (
+        <>
+          <SvcRow name="Dump power" value={fW(plat.P_final_dump)} color={SC[4]} />
+          <SvcRow name="Dump area" value={plat.A_dump.toFixed(0) + " m²"} color="#5a7a8a" />
+          <SvcRow name="Albedo reduction" value={plat.albedoReduction_pct.toFixed(0) + "%"}
+            detail="edge shields" color={SC[4]} />
+          <SvcRow name="Cal source power" value={fW(plat.calSourcePower)}
+            detail="known IR signature for sensors" color={SC[4]} />
+        </>
+      )},
+    ].map(({ n, title, color, content }) => (
+      <div key={n} style={{ marginBottom: 4 }}>
+        <button onClick={() => setExpandSt(expandSt === n ? null : n)}
+          style={{
+            width: "100%", display: "flex", alignItems: "center", gap: 6,
+            background: "#0d1520", border: `1px solid ${color}25`,
+            borderRadius: 4, padding: "5px 8px", cursor: "pointer", fontFamily: "inherit",
+          }}>
+          <div style={{
+            width: 16, height: 16, borderRadius: 2, background: `${color}20`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 9, color, fontWeight: 700,
+          }}>S{n}</div>
+          <span style={{ fontSize: 9, color, fontWeight: 600, flex: 1, textAlign: "left" }}>{title}</span>
+          <span style={{ fontSize: 9, color: "#3a5a6a" }}>{expandSt === n ? "▲" : "▼"}</span>
+        </button>
+        {expandSt === n && (
+          <div style={{ background: "#0d1520", borderRadius: "0 0 4px 4px", padding: "6px 8px", borderTop: "none" }}>
+            {content}
+          </div>
+        )}
+      </div>
+    ))}
+  </>}
+
+  {/* ━━━ TUNE ━━━ */}
+  {tab === "tune" && <>
+    {[
+      { title: "PLATFORM", color: "#ffffff", params: [
+        { key: "totalPower_kW", label: "Total Power", unit: "kW", min: 10, max: 2000, step: 10 },
+        { key: "numNodes", label: "Compute Nodes", unit: "", min: 1, max: 50, step: 1 },
+        { key: "computeEff", label: "Compute Efficiency", unit: "", min: 0.05, max: 0.5, step: 0.01 },
+      ]},
+      { title: "S1: LOCAL", color: SC[1], params: [
+        { key: "eclipseHeaterPerNode_W", label: "Heater/Node", unit: "W", min: 10, max: 200, step: 5 },
+        { key: "eclipseDuration_min", label: "Eclipse Duration", unit: "min", min: 10, max: 60, step: 1 },
+      ]},
+      { title: "S2: BUS", color: SC[2], params: [
+        { key: "propHeating_kW", label: "Prop Heating", unit: "kW", min: 0, max: 10, step: 0.5 },
+        { key: "tpvInputPower_kW", label: "TPV Input", unit: "kW", min: 0, max: 30, step: 0.5 },
+        { key: "tpvBlockTemp_K", label: "TPV Block Temp", unit: "K", min: 400, max: 800, step: 10 },
+        { key: "tpvEfficiency", label: "TPV Efficiency", unit: "", min: 0.05, max: 0.35, step: 0.01 },
+        { key: "attitudeLouver_W", label: "Attitude Louvers", unit: "W", min: 0, max: 1000, step: 10 },
+      ]},
+      { title: "S3: RADIATOR", color: SC[3], params: [
+        { key: "numTiles", label: "Tiles", unit: "", min: 4, max: 100, step: 1 },
+        { key: "tileArea_m2", label: "Tile Area", unit: "m²", min: 5, max: 50, step: 1 },
+        { key: "radTemp_K", label: "Radiator Temp", unit: "K", min: 250, max: 500, step: 5 },
+        { key: "hotGateFrac", label: "Hot Gate Frac", unit: "", min: 0.01, max: 0.3, step: 0.01 },
+        { key: "coneAngle_deg", label: "Cone Angle", unit: "°", min: 5, max: 45, step: 1 },
+        { key: "dockingTiles", label: "Docking Tiles", unit: "", min: 0, max: 10, step: 1 },
+      ]},
+    ].map(({ title, color, params: ps }) => (
+      <div key={title} style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: 9, color, fontWeight: 700, letterSpacing: 0.5, marginBottom: 6 }}>{title}</div>
+        {ps.map(p => <Sl key={p.key} {...p} value={params[p.key]} onChange={setP} accent={color} />)}
+      </div>
+    ))}
+  </>}
+
+  {/* ━━━ SCALING ━━━ */}
+  {tab === "scale" && <>
+    <div style={{ background: "#0d1520", border: "1px solid #1a2a3a", borderRadius: 4, padding: "8px 10px", marginBottom: 10 }}>
+      <div style={{ fontSize: 9, color: "#3a5a6a", letterSpacing: 0.5, marginBottom: 6 }}>
+        REUSE SATURATION vs POWER
+      </div>
+      {/* Bar chart showing saturation at different scales */}
+      {[50, 100, 200, 500, 1000].map(kw => {
+        const sim = computePlatform({ ...params, totalPower_kW: kw });
+        const sat = sim.reuseSaturation;
+        const isCurrent = kw === params.totalPower_kW;
+        return (
+          <div key={kw} style={{ marginBottom: 4 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, color: "#4a6a7a", marginBottom: 1 }}>
+              <span style={{ color: isCurrent ? "#00ccaa" : "#5a7a8a", fontWeight: isCurrent ? 700 : 400 }}>
+                {kw} kW {isCurrent ? "◄" : ""}
+              </span>
+              <span>{pct(sat)} reused | {fW(sim.totalReuse_W)}</span>
+            </div>
+            <div style={{ height: 8, background: "#0a0e14", borderRadius: 2, overflow: "hidden" }}>
+              <div style={{
+                width: `${sat * 100}%`, height: "100%",
+                background: sat > 0.2 ? "#00ccaa" : sat > 0.1 ? "#ffaa44" : "#ff4444",
+                borderRadius: 2, transition: "width 0.3s",
+              }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+
+    {/* Scaling issues */}
+    {plat.scalingIssues.length > 0 && (
+      <div style={{ background: "#0d1520", border: "1px solid #ff444430", borderRadius: 4, padding: "8px 10px", marginBottom: 10 }}>
+        <div style={{ fontSize: 9, color: "#ff4444", fontWeight: 700, marginBottom: 6 }}>SCALING WALLS</div>
+        {plat.scalingIssues.map((si, i) => (
+          <div key={i} style={{ marginBottom: 6, display: "flex", gap: 6 }}>
+            <div style={{
+              width: 8, height: 8, borderRadius: "50%", marginTop: 3, flexShrink: 0,
+              background: si.severity === "critical" ? "#ff4444" : "#ffaa44",
+              boxShadow: `0 0 6px ${si.severity === "critical" ? "#ff444460" : "#ffaa4460"}`,
+            }} />
+            <div>
+              <div style={{ fontSize: 10, color: si.severity === "critical" ? "#ff6644" : "#ffaa44", fontWeight: 600 }}>{si.issue}</div>
+              <div style={{ fontSize: 9, color: "#4a6a7a" }}>{si.detail}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    )}
+
+    {plat.scalingIssues.length === 0 && (
+      <div style={{ background: "#00ccaa08", border: "1px solid #00ccaa20", borderRadius: 4, padding: "8px 10px", marginBottom: 10 }}>
+        <div style={{ fontSize: 10, color: "#00ccaa", fontWeight: 600 }}>
+          Within single-vehicle envelope — no scaling walls hit
+        </div>
+      </div>
+    )}
+
+    <div style={{ background: "#0d1520", border: "1px solid #1a2a3a", borderRadius: 4, padding: "8px 10px", fontSize: 9, color: "#5a7a8a", lineHeight: 1.6 }}>
+      <b style={{ color: "#ff6644" }}>WHY 1MW BREAKS: </b>
+      Single-phase loop pressure drop exceeds COTS pump limits. Thermal customers (heaters, prop, TPV)
+      saturate — reuse ratio crashes. Hot gate coherence needs active management.
+      Radiator structural mass exceeds single-vehicle deploy.
+      Solution: distribute across loosely coupled swarm nodes.
+    </div>
+
+    <div style={{ marginTop: 10 }}>
+      <Sl key="totalPower_kW" k="totalPower_kW" label="Total Power" unit="kW" min={10} max={2000} step={10}
+        value={params.totalPower_kW} onChange={setP} accent="#ff6644" />
+    </div>
+  </>}
+
+  {/* ━━━ SWARM ━━━ */}
+  {tab === "swarm" && <>
+    <div style={{ background: "#0d1520", border: "1px solid #00ccaa25", borderRadius: 4, padding: "10px", marginBottom: 10 }}>
+      <div style={{ fontSize: 10, color: "#00ccaa", fontWeight: 700, marginBottom: 8 }}>
+        500m² THERMAL API
+      </div>
+      <div style={{ fontSize: 9, color: "#5a7a8a", lineHeight: 1.6, marginBottom: 8 }}>
+        The radiator array isn't dumb metal. It's an interface serving multiple consumers:
+      </div>
+
+      {[
+        { name: "Compute Cooling", capacity: fW(plat.P_final_dump), desc: "Primary thermal dump for payload", color: SC[1], pct: ((plat.P_final_dump / plat.P_waste) * 100).toFixed(0) },
+        { name: "Housekeeping", capacity: fW(plat.S1_reuse_W + plat.P_prop_heating), desc: "Eclipse survival + prop conditioning", color: SC[2], pct: (((plat.S1_reuse_W + plat.P_prop_heating) / plat.P_waste) * 100).toFixed(0) },
+        { name: "Signaling", capacity: fW(plat.P_beacon_total) + " + " + plat.beaconBitrate_bps + " bps", desc: "Directed IR beacon + nav data", color: SC[3], pct: ((plat.P_beacon_total / plat.P_waste) * 100).toFixed(1) },
+        { name: "Diagnostics", capacity: plat.diagnosticTiles + " tiles monitored", desc: "Thermal health → workload throttle", color: "#4488ff", pct: "—" },
+        { name: "Docking Support", capacity: fW(plat.dockingCapacity_W), desc: `${params.dockingTiles} tiles for visiting craft`, color: "#cc66ff", pct: ((plat.dockingCapacity_W / plat.P_waste) * 100).toFixed(0) },
+        { name: "Calibration", capacity: "Known IR signature", desc: "Sensor alignment reference", color: SC[4], pct: "—" },
+      ].map(({ name, capacity, desc, color, pct }, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 6, alignItems: "flex-start" }}>
+          <div style={{
+            width: 30, textAlign: "center", fontSize: 9, color, fontWeight: 700, flexShrink: 0, marginTop: 1,
+          }}>{pct}%</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ fontSize: 10, color, fontWeight: 600 }}>{name}</span>
+              <span style={{ fontSize: 9, color: "#4a6a7a" }}>{capacity}</span>
+            </div>
+            <div style={{ fontSize: 8, color: "#3a4a5a" }}>{desc}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+
+    {/* Swarm interactions */}
+    <div style={{ background: "#0d1520", border: "1px solid #ffaa4425", borderRadius: 4, padding: "10px", marginBottom: 10 }}>
+      <div style={{ fontSize: 10, color: "#ffaa44", fontWeight: 700, marginBottom: 8 }}>SWARM INTERACTIONS</div>
+
+      {[
+        { name: "Thermal Leasing", desc: "Ground stations schedule your beacon window → you get priority compute beam time in return. Each beacon slot is a tradeable resource.", color: "#00ccaa" },
+        { name: "Formation Heat Share", desc: "Neighbor vehicles dock cold plates to your docking tiles during their eclipse. Your waste heat is their survival.", color: "#ff8844" },
+        { name: "Depot Transient Dump", desc: "Orbital depots clamp on during high-workload bursts, absorbing thermal spikes your radiators can't handle alone.", color: "#4488ff" },
+        { name: "Swarm Calibration", desc: "Neighbors use your known IR signature as attitude reference. Your dump radiation is their sensor calibration source.", color: "#8866cc" },
+      ].map(({ name, desc, color }, i) => (
+        <div key={i} style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 10, color, fontWeight: 600, marginBottom: 2 }}>{name}</div>
+          <div style={{ fontSize: 9, color: "#5a7a8a", lineHeight: 1.5 }}>{desc}</div>
+        </div>
+      ))}
+    </div>
+
+    <div style={{
+      background: "#00ccaa06", border: "1px solid #00ccaa15", borderRadius: 4,
+      padding: "8px 10px", fontSize: 9, color: "#5a8a7a", lineHeight: 1.6,
+    }}>
+      <b style={{ color: "#00ccaa" }}>ENDGAME: </b>
+      Every m² of radiator has a thermal API. Utility/kg scales with number of services, not area.
+      Adding a swarm neighbor doesn't require more radiator — it requires more scheduling intelligence.
+      The 1MW scaling wall dissolves into N × 100kW nodes that trade thermal capacity like a market.
+    </div>
+  </>}
+
+  <div style={{ fontSize: 7, color: "#1a2a3a", textAlign: "center", padding: 10 }}>
+    Thermopylae Platform · 4-Stage Joule Lifecycle
+  </div>
+</div>
+```
+
+);
+}
