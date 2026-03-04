@@ -1,0 +1,670 @@
+import { useState, useMemo, useCallback, useEffect, useRef } from “react”;
+
+// ═══════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════
+const σ = 5.670374419e-8;
+
+// ═══════════════════════════════════════════════════════════════
+// NODE ENGINE — each node is a 100kW-class platform
+// ═══════════════════════════════════════════════════════════════
+function computeNode(p, workloadFrac, radiatorDamage, receivedHeat, exportedHeat) {
+const P_in = p.nodePower_kW * 1000 * workloadFrac;
+const P_compute = P_in * p.computeEff;
+const P_waste = P_in * (1 - p.computeEff);
+
+// Stage 1-2: internal reuse (same as single platform)
+const P_eclipse = p.eclipseHeater_W;
+const P_prop = p.propHeating_W;
+const P_tpv_in = p.tpvInput_W;
+const P_tpv_out = P_tpv_in * p.tpvEff;
+const P_attitude = p.attitudeLouver_W;
+const P_internal_reuse = P_eclipse + P_prop + P_tpv_out + P_attitude;
+const P_to_rad = Math.max(0, P_waste - P_prop - P_tpv_in - P_attitude + (P_tpv_in * (1 - p.tpvEff)));
+
+// Radiator capacity (with damage)
+const A_total = p.tilesPerNode * p.tileArea_m2;
+const A_effective = A_total * (1 - radiatorDamage);
+const q_rad = p.emissivity * σ * (Math.pow(p.radTemp_K, 4) - Math.pow(p.sinkTemp_K, 4));
+const P_rad_capacity = q_rad * A_effective;
+
+// Thermal balance
+const P_need_to_dump = P_to_rad + receivedHeat;
+const P_actually_dumped = Math.min(P_need_to_dump, P_rad_capacity) + exportedHeat;
+const thermalMargin = P_rad_capacity > 0 ? 1 - (P_need_to_dump / P_rad_capacity) : -1;
+const isOverheating = thermalMargin < 0;
+
+// Hot gate comms
+const A_hotgate = A_effective * p.hotGateFrac;
+const P_beacon = A_hotgate * q_rad * p.beaconModEff;
+
+return {
+P_in, P_compute, P_waste, P_internal_reuse, P_to_rad,
+A_total, A_effective, P_rad_capacity, P_need_to_dump,
+thermalMargin, isOverheating, P_beacon,
+workloadFrac, radiatorDamage,
+};
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SWARM ENGINE — federation, leasing, resilience
+// ═══════════════════════════════════════════════════════════════
+function computeSwarm(p, nodeStates) {
+const N = p.numNodes;
+
+// Per-node compute with workload and damage
+const nodes = [];
+let totalCompute = 0, totalWaste = 0, totalReuse = 0;
+let totalRadCap = 0, totalRadNeed = 0;
+let totalBeacon = 0;
+let hotNodes = [], coldNodes = [];
+
+for (let i = 0; i < N; i++) {
+const ns = nodeStates[i] || { workload: 1.0, damage: 0 };
+const node = computeNode(p, ns.workload, ns.damage, 0, 0);
+nodes.push(node);
+totalCompute += node.P_compute;
+totalWaste += node.P_waste;
+totalReuse += node.P_internal_reuse;
+totalRadCap += node.P_rad_capacity;
+totalRadNeed += node.P_need_to_dump;
+totalBeacon += node.P_beacon;
+if (node.thermalMargin < 0.1) hotNodes.push(i);
+if (node.thermalMargin > 0.3) coldNodes.push(i);
+}
+
+// ── THERMAL LEASING ──────────────────────────────────────
+// Hot nodes export to cold nodes
+let thermalTransfers = [];
+let totalLeased = 0;
+const hotCopy = […hotNodes];
+const coldCopy = […coldNodes];
+
+for (const hi of hotCopy) {
+if (coldCopy.length === 0) break;
+const hotNode = nodes[hi];
+const deficit = hotNode.P_need_to_dump - hotNode.P_rad_capacity;
+if (deficit <= 0) continue;
+
+```
+const ci = coldCopy[0];
+const coldNode = nodes[ci];
+const surplus = coldNode.P_rad_capacity - coldNode.P_need_to_dump;
+const transfer = Math.min(deficit, surplus * 0.8, p.maxIRTransfer_W);
+
+if (transfer > 0) {
+  thermalTransfers.push({ from: hi, to: ci, power: transfer });
+  totalLeased += transfer;
+  // Update margins conceptually
+  nodes[hi] = { ...nodes[hi], thermalMargin: nodes[hi].thermalMargin + transfer / nodes[hi].P_rad_capacity };
+  nodes[ci] = { ...nodes[ci], thermalMargin: nodes[ci].thermalMargin - transfer / nodes[ci].P_rad_capacity };
+  if (nodes[ci].thermalMargin < 0.3) coldCopy.shift();
+}
+```
+
+}
+
+// ── WORKLOAD FEDERATION ──────────────────────────────────
+// Overheating nodes shed compute to cold neighbors
+let workloadMigrations = [];
+for (const hi of hotNodes) {
+if (nodes[hi].thermalMargin < 0 && coldNodes.length > 0) {
+const shedFrac = Math.min(0.3, -nodes[hi].thermalMargin);
+const target = coldNodes[0];
+workloadMigrations.push({ from: hi, to: target, fraction: shedFrac });
+}
+}
+
+// ── RESILIENCE ───────────────────────────────────────────
+// If node loses radiator, compute redistributes
+const damagedNodes = nodeStates.filter(ns => ns.damage > 0).length;
+const totalDamage = nodeStates.reduce((s, ns) => s + ns.damage, 0) / N;
+const effectiveCapacity = 1 - (totalDamage * 0.5); // graceful degradation
+const capacityLossPerNode = damagedNodes > 0 ? (totalDamage / N) : 0;
+
+// ── IR RANGING MESH ──────────────────────────────────────
+// N nodes → N(N-1)/2 baselines
+const numBaselines = N * (N - 1) / 2;
+const maxBaseline_m = p.formationSpacing_m * 1.5;
+// Angular resolution: λ/D where D = max baseline
+const λ_peak = 2.898e-3 / p.radTemp_K;
+const angularRes_rad = λ_peak / maxBaseline_m;
+const angularRes_arcsec = angularRes_rad * 206265;
+// Ranging precision: ~λ/SNR
+const rangingPrecision_mm = (λ_peak / 100) * 1000; // assume SNR~100
+
+// ── HOT GATE LINK BUDGET ─────────────────────────────────
+const d_link = p.formationSpacing_m;
+const λ_m = λ_peak;
+const freeSpaceLoss_dB = 20 * Math.log10(4 * Math.PI * d_link / λ_m);
+const photonsPerBit = 1e4; // spec: 10⁴ photons/bit
+const linkBitrate = p.gateBitrate_bps;
+// 8-bit node ID + 8-bit thermal margin, repeated
+const frameSize_bits = 16;
+const frameRate = linkBitrate / frameSize_bits;
+
+// ── THERMAL ECONOMY ──────────────────────────────────────
+const swarmMarginAvg = nodes.reduce((s, n) => s + n.thermalMargin, 0) / N;
+const swarmMarginMin = Math.min(…nodes.map(n => n.thermalMargin));
+const swarmMarginMax = Math.max(…nodes.map(n => n.thermalMargin));
+const headroom = swarmMarginAvg;
+
+// Revenue model: excess capacity as tradeable asset
+const excessCooling_W = Math.max(0, totalRadCap - totalRadNeed);
+const coolingPrice_per_W = 0.001; // $/W/hr hypothetical
+const hourlyRevenue = excessCooling_W * coolingPrice_per_W;
+
+// ── 10MW SCALING ─────────────────────────────────────────
+const swarms_for_10MW = 10;
+const total_10MW_nodes = N * swarms_for_10MW;
+const total_10MW_area = totalRadCap / q_rad_helper(p) * swarms_for_10MW;
+const total_10MW_baselines = total_10MW_nodes * (total_10MW_nodes - 1) / 2;
+
+return {
+nodes, N,
+totalCompute, totalWaste, totalReuse,
+totalRadCap, totalRadNeed,
+totalBeacon,
+// Leasing
+thermalTransfers, totalLeased, hotNodes, coldNodes,
+// Workload
+workloadMigrations,
+// Resilience
+damagedNodes, effectiveCapacity, totalDamage,
+// Mesh
+numBaselines, angularRes_arcsec, rangingPrecision_mm,
+// Link
+freeSpaceLoss_dB, linkBitrate, frameRate,
+// Economy
+swarmMarginAvg, swarmMarginMin, swarmMarginMax, headroom,
+excessCooling_W, hourlyRevenue,
+// 10MW
+swarms_for_10MW, total_10MW_nodes, total_10MW_area, total_10MW_baselines,
+};
+}
+
+function q_rad_helper(p) {
+return p.emissivity * σ * (Math.pow(p.radTemp_K, 4) - Math.pow(p.sinkTemp_K, 4));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UI HELPERS
+// ═══════════════════════════════════════════════════════════════
+const fmt = (n, d = 1) => {
+if (!isFinite(n)) return “∞”;
+const a = Math.abs(n);
+if (a >= 1e6) return (n / 1e6).toFixed(d) + “M”;
+if (a >= 1e3) return (n / 1e3).toFixed(d) + “k”;
+return n.toFixed(d);
+};
+const fW = w => {
+if (Math.abs(w) >= 1e6) return (w / 1e6).toFixed(1) + “ MW”;
+if (Math.abs(w) >= 1e3) return (w / 1e3).toFixed(1) + “ kW”;
+if (Math.abs(w) >= 1) return w.toFixed(1) + “ W”;
+return (w * 1000).toFixed(0) + “ mW”;
+};
+const pct = v => (v * 100).toFixed(1) + “%”;
+
+function Sl({ k, label, unit, min, max, step, value, onChange, accent = “#00ccaa” }) {
+return (
+<div style={{ marginBottom: 7 }}>
+<div style={{ display: “flex”, justifyContent: “space-between”, marginBottom: 1 }}>
+<span style={{ fontSize: 9, color: “#5a7a8a” }}>{label}</span>
+<span style={{ fontSize: 9, color: accent, fontWeight: 600 }}>
+{Number.isInteger(step) && step >= 1 ? value : value.toFixed(2)}{unit ? ` ${unit}` : “”}
+</span>
+</div>
+<input type=“range” min={min} max={max} step={step} value={value}
+onChange={e => onChange(k, parseFloat(e.target.value))}
+style={{ width: “100%”, height: 18, accentColor: accent, cursor: “pointer” }} />
+</div>
+);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NODE VISUALIZATION — formation view
+// ═══════════════════════════════════════════════════════════════
+function FormationView({ swarm, nodeStates, onToggleDamage }) {
+const N = swarm.N;
+const W = 320, H = 280;
+const cx = W / 2, cy = H / 2, R = 100;
+
+// Node positions in circle
+const positions = [];
+for (let i = 0; i < N; i++) {
+const angle = (i / N) * 2 * Math.PI - Math.PI / 2;
+positions.push({ x: cx + R * Math.cos(angle), y: cy + R * Math.sin(angle) });
+}
+
+return (
+<svg viewBox={`0 0 ${W} ${H}`} style={{ width: “100%”, maxWidth: 340, height: “auto” }}>
+{/* Transfer lines */}
+{swarm.thermalTransfers.map((t, i) => (
+<line key={“t” + i}
+x1={positions[t.from].x} y1={positions[t.from].y}
+x2={positions[t.to].x} y2={positions[t.to].y}
+stroke=”#ff884488” strokeWidth={Math.max(1, t.power / 20)}
+strokeDasharray=“4,3” />
+))}
+
+```
+  {/* Workload migration lines */}
+  {swarm.workloadMigrations.map((m, i) => (
+    <line key={"m" + i}
+      x1={positions[m.from].x} y1={positions[m.from].y}
+      x2={positions[m.to].x} y2={positions[m.to].y}
+      stroke="#4488ff44" strokeWidth={2} strokeDasharray="2,4" />
+  ))}
+
+  {/* IR mesh baselines (faint) */}
+  {positions.map((p1, i) =>
+    positions.slice(i + 1).map((p2, j) => (
+      <line key={`b${i}-${i + j + 1}`}
+        x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y}
+        stroke="#00ccaa08" strokeWidth={0.5} />
+    ))
+  )}
+
+  {/* Nodes */}
+  {swarm.nodes.map((node, i) => {
+    const p = positions[i];
+    const margin = node.thermalMargin;
+    const damaged = nodeStates[i].damage > 0;
+    const color = margin < 0 ? "#ff4444" : margin < 0.1 ? "#ffaa44" : margin < 0.3 ? "#00ccaa" : "#00ffaa";
+    const r = 16 + (node.workloadFrac * 8);
+    return (
+      <g key={i} onClick={() => onToggleDamage(i)} style={{ cursor: "pointer" }}>
+        {/* Radiator halo */}
+        <circle cx={p.x} cy={p.y} r={r + 6} fill={color} opacity={0.08} />
+        {/* Node body */}
+        <circle cx={p.x} cy={p.y} r={r}
+          fill="#0d1520" stroke={color} strokeWidth={damaged ? 1 : 2}
+          strokeDasharray={damaged ? "3,3" : "none"} />
+        {/* Margin indicator */}
+        <circle cx={p.x} cy={p.y} r={r * Math.max(0, margin)}
+          fill={color} opacity={0.2} />
+        {/* Label */}
+        <text x={p.x} y={p.y - 3} textAnchor="middle" fill={color} fontSize={9} fontWeight={700}
+          fontFamily="monospace">N{i}</text>
+        <text x={p.x} y={p.y + 7} textAnchor="middle" fill="#4a6a7a" fontSize={7}
+          fontFamily="monospace">{pct(margin)}</text>
+        {/* Damage X */}
+        {damaged && <>
+          <line x1={p.x - 5} y1={p.y - 12} x2={p.x + 5} y2={p.y - 6} stroke="#ff4444" strokeWidth={2} />
+          <line x1={p.x + 5} y1={p.y - 12} x2={p.x - 5} y2={p.y - 6} stroke="#ff4444" strokeWidth={2} />
+        </>}
+      </g>
+    );
+  })}
+
+  {/* Legend */}
+  <text x={10} y={H - 8} fill="#3a5a6a" fontSize={7} fontFamily="monospace">
+    Tap node to damage/repair · Orange=thermal transfer · Blue=workload migration
+  </text>
+</svg>
+```
+
+);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DEFAULTS
+// ═══════════════════════════════════════════════════════════════
+const SWARM_DEFAULTS = {
+numNodes: 10,
+nodePower_kW: 100,
+computeEff: 0.15,
+// Internal reuse
+eclipseHeater_W: 500, propHeating_W: 2000,
+tpvInput_W: 5000, tpvEff: 0.15,
+attitudeLouver_W: 200,
+// Radiator
+tilesPerNode: 20, tileArea_m2: 25,
+radTemp_K: 335, emissivity: 0.92, sinkTemp_K: 3,
+radDensity_kgm2: 5,
+// Hot gates
+hotGateFrac: 0.10, beaconModEff: 0.02,
+// Swarm
+formationSpacing_m: 300,
+maxIRTransfer_W: 50,
+gateBitrate_bps: 100,
+};
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════
+export default function ThermopylaeSwarm() {
+const [params, setParams] = useState(SWARM_DEFAULTS);
+const [tab, setTab] = useState(“formation”);
+const [nodeStates, setNodeStates] = useState(
+Array.from({ length: 10 }, () => ({ workload: 1.0, damage: 0 }))
+);
+const [selectedNode, setSelectedNode] = useState(null);
+
+// Keep nodeStates in sync with numNodes
+useEffect(() => {
+setNodeStates(prev => {
+const n = params.numNodes;
+if (prev.length === n) return prev;
+if (prev.length < n) return […prev, …Array.from({ length: n - prev.length }, () => ({ workload: 1.0, damage: 0 }))];
+return prev.slice(0, n);
+});
+}, [params.numNodes]);
+
+const setP = useCallback((k, v) => setParams(p => ({ …p, [k]: v })), []);
+
+const toggleDamage = useCallback((i) => {
+setNodeStates(prev => {
+const next = […prev];
+next[i] = { …next[i], damage: next[i].damage > 0 ? 0 : 0.5 };
+return next;
+});
+}, []);
+
+const setNodeWorkload = useCallback((i, wl) => {
+setNodeStates(prev => {
+const next = […prev];
+next[i] = { …next[i], workload: wl };
+return next;
+});
+}, []);
+
+const swarm = useMemo(() => computeSwarm(params, nodeStates), [params, nodeStates]);
+
+const tabBtn = (t, label) => (
+<button onClick={() => setTab(t)} style={{
+flex: 1, padding: “6px 0”, textAlign: “center”, fontSize: 9, fontWeight: 600,
+color: tab === t ? “#00ccaa” : “#3a5a6a”, background: tab === t ? “#00ccaa08” : “transparent”,
+border: “none”, borderBottom: `2px solid ${tab === t ? "#00ccaa" : "#1a2a3a"}`,
+cursor: “pointer”, fontFamily: “inherit”,
+}}>{label}</button>
+);
+
+return (
+<div style={{
+background: “#0a0e14”, color: “#c0d0d8”, minHeight: “100vh”,
+fontFamily: “‘JetBrains Mono’,‘Fira Code’,‘SF Mono’,monospace”,
+fontSize: 13, padding: “12px 10px”, maxWidth: 420, margin: “0 auto”,
+}}>
+{/* Header */}
+<div style={{ borderBottom: “1px solid #1a2a3a”, paddingBottom: 8, marginBottom: 10 }}>
+<div style={{ fontSize: 13, color: “#00ccaa”, fontWeight: 700, letterSpacing: 1.5 }}>THERMOPYLAE SWARM</div>
+<div style={{ fontSize: 9, color: “#3a5a6a”, marginTop: 2 }}>
+{params.numNodes} × {params.nodePower_kW}kW = {params.numNodes * params.nodePower_kW / 1000} MW · Thermal economy
+</div>
+</div>
+
+```
+  {/* Headlines */}
+  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 10 }}>
+    {[
+      { l: "COMPUTE", v: fW(swarm.totalCompute), c: "#4488ff" },
+      { l: "MARGIN", v: pct(swarm.swarmMarginAvg), c: swarm.swarmMarginAvg > 0.15 ? "#00ffaa" : swarm.swarmMarginAvg > 0 ? "#ffaa44" : "#ff4444" },
+      { l: "EXCESS", v: fW(swarm.excessCooling_W), c: "#00ccaa" },
+    ].map(({ l, v, c }) => (
+      <div key={l} style={{ background: "#0d1520", border: `1px solid ${c}25`, borderRadius: 4, padding: "5px 6px", textAlign: "center" }}>
+        <div style={{ fontSize: 7, color: "#3a5a6a", letterSpacing: 0.5 }}>{l}</div>
+        <div style={{ fontSize: 14, color: c, fontWeight: 700 }}>{v}</div>
+      </div>
+    ))}
+  </div>
+
+  {/* Tabs */}
+  <div style={{ display: "flex", marginBottom: 10 }}>
+    {tabBtn("formation", "FORMATION")}
+    {tabBtn("economy", "ECONOMY")}
+    {tabBtn("mesh", "IR MESH")}
+    {tabBtn("config", "CONFIG")}
+  </div>
+
+  {/* ━━━ FORMATION ━━━ */}
+  {tab === "formation" && <>
+    <FormationView swarm={swarm} nodeStates={nodeStates} onToggleDamage={toggleDamage} />
+
+    {/* Node list */}
+    <div style={{ marginTop: 6 }}>
+      {swarm.nodes.map((node, i) => {
+        const isSelected = selectedNode === i;
+        const mc = node.thermalMargin < 0 ? "#ff4444" : node.thermalMargin < 0.1 ? "#ffaa44" : "#00ccaa";
+        return (
+          <div key={i}>
+            <button onClick={() => setSelectedNode(isSelected ? null : i)}
+              style={{
+                width: "100%", display: "flex", alignItems: "center", gap: 6,
+                background: "#0d1520", border: `1px solid ${mc}20`,
+                borderRadius: 4, padding: "4px 8px", marginBottom: 2,
+                cursor: "pointer", fontFamily: "inherit",
+              }}>
+              <div style={{ width: 8, height: 8, borderRadius: "50%", background: mc, boxShadow: `0 0 4px ${mc}40` }} />
+              <span style={{ fontSize: 9, color: mc, fontWeight: 600, width: 24 }}>N{i}</span>
+              <span style={{ fontSize: 8, color: "#4a6a7a", flex: 1, textAlign: "left" }}>
+                {fW(node.P_waste)} waste · {pct(node.thermalMargin)} margin
+                {nodeStates[i].damage > 0 ? " · DAMAGED" : ""}
+              </span>
+              <span style={{ fontSize: 8, color: "#3a5a6a" }}>{isSelected ? "▲" : "▼"}</span>
+            </button>
+            {isSelected && (
+              <div style={{ background: "#0d1520", padding: "6px 8px", marginBottom: 4, borderRadius: "0 0 4px 4px" }}>
+                <div style={{ marginBottom: 6 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, marginBottom: 1 }}>
+                    <span style={{ color: "#5a7a8a" }}>Workload</span>
+                    <span style={{ color: "#4488ff" }}>{pct(nodeStates[i].workload)}</span>
+                  </div>
+                  <input type="range" min={0} max={1} step={0.05} value={nodeStates[i].workload}
+                    onChange={e => setNodeWorkload(i, parseFloat(e.target.value))}
+                    style={{ width: "100%", height: 16, accentColor: "#4488ff", cursor: "pointer" }} />
+                </div>
+                {[
+                  { l: "Power In", v: fW(node.P_in) },
+                  { l: "Compute", v: fW(node.P_compute) },
+                  { l: "Waste", v: fW(node.P_waste) },
+                  { l: "Internal Reuse", v: fW(node.P_internal_reuse) },
+                  { l: "Rad Capacity", v: fW(node.P_rad_capacity) },
+                  { l: "Rad Needed", v: fW(node.P_need_to_dump) },
+                  { l: "Effective Area", v: node.A_effective.toFixed(0) + " m²" },
+                ].map(({ l, v }) => (
+                  <div key={l} style={{ display: "flex", justifyContent: "space-between", fontSize: 9, padding: "1px 0" }}>
+                    <span style={{ color: "#4a6a7a" }}>{l}</span>
+                    <span style={{ color: "#7a9aaa" }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+
+    {/* Resilience summary */}
+    {swarm.damagedNodes > 0 && (
+      <div style={{
+        background: "#ff444410", border: "1px solid #ff444425", borderRadius: 4,
+        padding: "6px 8px", marginTop: 6, fontSize: 9, color: "#aa6644", lineHeight: 1.5,
+      }}>
+        <b style={{ color: "#ff6644" }}>{swarm.damagedNodes} node(s) damaged.</b> Swarm at{" "}
+        <b style={{ color: "#ffaa44" }}>{pct(swarm.effectiveCapacity)}</b> effective capacity.
+        {swarm.thermalTransfers.length > 0 && (
+          <> Thermal leasing active: {fW(swarm.totalLeased)} transferred across {swarm.thermalTransfers.length} link(s).</>
+        )}
+        {swarm.workloadMigrations.length > 0 && (
+          <> Workload shed to {swarm.workloadMigrations.length} peer(s).</>
+        )}
+      </div>
+    )}
+  </>}
+
+  {/* ━━━ ECONOMY ━━━ */}
+  {tab === "economy" && <>
+    <div style={{ background: "#0d1520", border: "1px solid #00ccaa25", borderRadius: 4, padding: "8px 10px", marginBottom: 10 }}>
+      <div style={{ fontSize: 10, color: "#00ccaa", fontWeight: 700, marginBottom: 8 }}>THERMAL ECONOMY</div>
+
+      {/* Margin distribution */}
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ fontSize: 8, color: "#3a5a6a", marginBottom: 4 }}>NODE THERMAL MARGINS</div>
+        <div style={{ display: "flex", gap: 2, height: 30, alignItems: "flex-end" }}>
+          {swarm.nodes.map((n, i) => {
+            const h = Math.max(2, Math.min(28, (n.thermalMargin + 0.2) / 0.7 * 28));
+            const c = n.thermalMargin < 0 ? "#ff4444" : n.thermalMargin < 0.1 ? "#ffaa44" : "#00ccaa";
+            return (
+              <div key={i} style={{
+                flex: 1, height: h, background: c, borderRadius: "2px 2px 0 0",
+                opacity: 0.8, transition: "height 0.3s",
+              }} />
+            );
+          })}
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 7, color: "#3a5a6a", marginTop: 2 }}>
+          <span>min: {pct(swarm.swarmMarginMin)}</span>
+          <span>avg: {pct(swarm.swarmMarginAvg)}</span>
+          <span>max: {pct(swarm.swarmMarginMax)}</span>
+        </div>
+      </div>
+
+      {/* Economy stats */}
+      {[
+        { l: "Total rad capacity", v: fW(swarm.totalRadCap), c: "#00ccaa" },
+        { l: "Total rad demand", v: fW(swarm.totalRadNeed), c: "#ff8844" },
+        { l: "Excess cooling (tradeable)", v: fW(swarm.excessCooling_W), c: "#00ffaa" },
+        { l: "Thermal transfers active", v: swarm.thermalTransfers.length + " links, " + fW(swarm.totalLeased), c: "#ffaa44" },
+        { l: "Workload migrations", v: swarm.workloadMigrations.length + " active", c: "#4488ff" },
+        { l: "Swarm beacon total", v: fW(swarm.totalBeacon), c: "#00ccaa" },
+      ].map(({ l, v, c }) => (
+        <div key={l} style={{ display: "flex", justifyContent: "space-between", fontSize: 9, padding: "3px 0", borderBottom: "1px solid #0a0e14" }}>
+          <span style={{ color: "#5a7a8a" }}>{l}</span>
+          <span style={{ color: c, fontWeight: 600 }}>{v}</span>
+        </div>
+      ))}
+    </div>
+
+    {/* Swarm roles */}
+    <div style={{ background: "#0d1520", border: "1px solid #1a2a3a", borderRadius: 4, padding: "8px 10px", marginBottom: 10 }}>
+      <div style={{ fontSize: 10, color: "#ffaa44", fontWeight: 700, marginBottom: 6 }}>ASSET CLASSES</div>
+      {[
+        { name: "Compute (exciter)", desc: "Makes heat. Jobs flow to cold nodes.", icon: "⚡", v: fW(swarm.totalCompute), c: "#4488ff" },
+        { name: "Radiators (farms)", desc: "Headroom = wealth. Excess capacity is revenue.", icon: "▦", v: fmt(params.tilesPerNode * params.tileArea_m2 * params.numNodes, 0) + " m²", c: "#00ccaa" },
+        { name: "Gates (bonds)", desc: "Thermal + info flow. 16-bit frames at " + params.gateBitrate_bps + " bps.", icon: "⇌", v: fW(swarm.totalBeacon), c: "#ffaa44" },
+        { name: "Ground (consumers)", desc: "Beam power for cooling slots. Bilateral trades.", icon: "⬇", v: "$" + swarm.hourlyRevenue.toFixed(2) + "/hr", c: "#8866cc" },
+      ].map(({ name, desc, icon, v, c }, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+          <div style={{ width: 24, height: 24, borderRadius: 3, background: `${c}15`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, flexShrink: 0 }}>{icon}</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ fontSize: 10, color: c, fontWeight: 600 }}>{name}</span>
+              <span style={{ fontSize: 9, color: "#4a6a7a" }}>{v}</span>
+            </div>
+            <div style={{ fontSize: 8, color: "#3a4a5a", lineHeight: 1.4 }}>{desc}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+
+    {/* 10MW projection */}
+    <div style={{ background: "#00ccaa06", border: "1px solid #00ccaa15", borderRadius: 4, padding: "8px 10px", fontSize: 9, color: "#5a8a7a", lineHeight: 1.6 }}>
+      <b style={{ color: "#00ccaa" }}>10 MW PROJECTION: </b>
+      {swarm.swarms_for_10MW} swarms × {params.numNodes} nodes = {swarm.total_10MW_nodes} platforms.
+      ~{(swarm.total_10MW_nodes * params.tilesPerNode * params.tileArea_m2 / 1000).toFixed(0)}k m² total radiator.
+      {swarm.total_10MW_baselines.toLocaleString()} IR baselines.
+      Mass scales linearly. Utility compounds: each new swarm adds to the thermal market and the ranging mesh.
+      Federation via lunar relay keeps swarms decoupled at orbital-mechanic scale.
+    </div>
+  </>}
+
+  {/* ━━━ IR MESH ━━━ */}
+  {tab === "mesh" && <>
+    <div style={{ background: "#0d1520", border: "1px solid #00ccaa25", borderRadius: 4, padding: "8px 10px", marginBottom: 10 }}>
+      <div style={{ fontSize: 10, color: "#00ccaa", fontWeight: 700, marginBottom: 8 }}>DISTRIBUTED IR INTERFEROMETER</div>
+
+      {[
+        { l: "Nodes", v: params.numNodes.toString(), c: "#00ccaa" },
+        { l: "Baselines", v: swarm.numBaselines.toString(), c: "#4488ff" },
+        { l: "Max baseline", v: (params.formationSpacing_m * 1.5).toFixed(0) + " m", c: "#ffaa44" },
+        { l: "Angular resolution", v: swarm.angularRes_arcsec.toFixed(4) + "″", c: "#00ffaa" },
+        { l: "Ranging precision", v: swarm.rangingPrecision_mm.toFixed(2) + " mm", c: "#00ffaa" },
+        { l: "Free space loss", v: swarm.freeSpaceLoss_dB.toFixed(1) + " dB", c: "#ff8844" },
+      ].map(({ l, v, c }) => (
+        <div key={l} style={{ display: "flex", justifyContent: "space-between", fontSize: 10, padding: "3px 0", borderBottom: "1px solid #0a0e14" }}>
+          <span style={{ color: "#5a7a8a" }}>{l}</span>
+          <span style={{ color: c, fontWeight: 600 }}>{v}</span>
+        </div>
+      ))}
+    </div>
+
+    {/* Gate frame format */}
+    <div style={{ background: "#0d1520", border: "1px solid #ffaa4425", borderRadius: 4, padding: "8px 10px", marginBottom: 10 }}>
+      <div style={{ fontSize: 10, color: "#ffaa44", fontWeight: 700, marginBottom: 6 }}>GATE FRAME FORMAT</div>
+      <div style={{ display: "flex", gap: 2, marginBottom: 6 }}>
+        <div style={{ flex: 1, background: "#4488ff20", border: "1px solid #4488ff40", borderRadius: 2, padding: "4px", textAlign: "center" }}>
+          <div style={{ fontSize: 7, color: "#4488ff" }}>NODE ID</div>
+          <div style={{ fontSize: 11, color: "#4488ff", fontWeight: 700 }}>8 bit</div>
+        </div>
+        <div style={{ flex: 1, background: "#00ccaa20", border: "1px solid #00ccaa40", borderRadius: 2, padding: "4px", textAlign: "center" }}>
+          <div style={{ fontSize: 7, color: "#00ccaa" }}>MARGIN</div>
+          <div style={{ fontSize: 11, color: "#00ccaa", fontWeight: 700 }}>8 bit</div>
+        </div>
+      </div>
+      <div style={{ fontSize: 9, color: "#4a6a7a", lineHeight: 1.5 }}>
+        16 bits/frame × {swarm.frameRate.toFixed(1)} frames/sec = {params.gateBitrate_bps} bps per gate.
+        OOK modulation via 1% duty cycle PCM thermal pulse.
+        Each node broadcasts: "I am N{"{x}"}, I have {"{y}"}% margin."
+        10⁴ photons/bit at {params.formationSpacing_m}m = error-free link.
+      </div>
+    </div>
+
+    {/* Formation spacing slider */}
+    <Sl k="formationSpacing_m" label="Formation Spacing" unit="m" min={50} max={1000} step={10}
+      value={params.formationSpacing_m} onChange={setP} accent="#00ccaa" />
+    <Sl k="gateBitrate_bps" label="Gate Bitrate" unit="bps" min={10} max={1000} step={10}
+      value={params.gateBitrate_bps} onChange={setP} accent="#ffaa44" />
+
+    <div style={{
+      background: "#00ccaa06", border: "1px solid #00ccaa15", borderRadius: 4,
+      padding: "8px 10px", fontSize: 9, color: "#5a8a7a", lineHeight: 1.6, marginTop: 6,
+    }}>
+      <b style={{ color: "#00ccaa" }}>NO RF REQUIRED: </b>
+      Formation control via mutual IR ranging. Each gate is both a beacon and a rangefinder.
+      cm-level precision from waste-heat photons. The thermal exhaust IS the navigation system.
+    </div>
+  </>}
+
+  {/* ━━━ CONFIG ━━━ */}
+  {tab === "config" && <>
+    {[
+      { title: "SWARM", color: "#ffffff", ps: [
+        { key: "numNodes", label: "Nodes", unit: "", min: 2, max: 20, step: 1 },
+        { key: "nodePower_kW", label: "Power/Node", unit: "kW", min: 10, max: 500, step: 10 },
+        { key: "computeEff", label: "Compute Eff", unit: "", min: 0.05, max: 0.5, step: 0.01 },
+        { key: "formationSpacing_m", label: "Spacing", unit: "m", min: 50, max: 1000, step: 10 },
+      ]},
+      { title: "NODE THERMAL", color: "#ff8844", ps: [
+        { key: "eclipseHeater_W", label: "Eclipse Heater", unit: "W", min: 100, max: 2000, step: 50 },
+        { key: "propHeating_W", label: "Prop Heating", unit: "W", min: 500, max: 5000, step: 100 },
+        { key: "tpvInput_W", label: "TPV Input", unit: "W", min: 1000, max: 15000, step: 500 },
+        { key: "tpvEff", label: "TPV Efficiency", unit: "", min: 0.05, max: 0.35, step: 0.01 },
+      ]},
+      { title: "RADIATOR", color: "#00ccaa", ps: [
+        { key: "tilesPerNode", label: "Tiles/Node", unit: "", min: 4, max: 40, step: 1 },
+        { key: "tileArea_m2", label: "Tile Area", unit: "m²", min: 5, max: 50, step: 1 },
+        { key: "radTemp_K", label: "Rad Temp", unit: "K", min: 250, max: 500, step: 5 },
+        { key: "emissivity", label: "Emissivity", unit: "", min: 0.5, max: 0.98, step: 0.01 },
+        { key: "hotGateFrac", label: "Hot Gate Frac", unit: "", min: 0.01, max: 0.3, step: 0.01 },
+      ]},
+      { title: "SWARM LINKS", color: "#4488ff", ps: [
+        { key: "maxIRTransfer_W", label: "Max IR Transfer", unit: "W", min: 5, max: 200, step: 5 },
+        { key: "gateBitrate_bps", label: "Gate Bitrate", unit: "bps", min: 10, max: 1000, step: 10 },
+      ]},
+    ].map(({ title, color, ps }) => (
+      <div key={title} style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: 9, color, fontWeight: 700, letterSpacing: 0.5, marginBottom: 5 }}>{title}</div>
+        {ps.map(p => <Sl key={p.key} {...p} value={params[p.key]} onChange={setP} accent={color} />)}
+      </div>
+    ))}
+  </>}
+
+  <div style={{ fontSize: 7, color: "#1a2a3a", textAlign: "center", padding: 10 }}>
+    Thermopylae Swarm · Thermal Economy · Distributed IR Mesh
+  </div>
+</div>
+```
+
+);
+}
