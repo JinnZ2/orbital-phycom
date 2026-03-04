@@ -1,0 +1,614 @@
+import { useState, useMemo, useCallback } from “react”;
+
+// ─── PHYSICS CONSTANTS ────────────────────────────────────────
+const STEFAN_BOLTZMANN = 5.670374419e-8;
+const SOLAR_FLUX_LEO = 1361;
+const BOLTZMANN_K = 1.380649e-23;
+const PLANCK_H = 6.62607015e-34;
+const SPEED_C = 2.998e8;
+const PI = Math.PI;
+
+// ─── THERMAL ENGINE ───────────────────────────────────────────
+function computeThermalState(params) {
+const {
+computePower_kW, efficiency, radiatorTemp_K, emissivity,
+sinkTemp_K, radiatorDensity, launchCost, computeDensity,
+} = params;
+const computePower_W = computePower_kW * 1000;
+const wasteHeat_W = computePower_W * (1 - efficiency);
+const radPower_per_m2 = emissivity * STEFAN_BOLTZMANN *
+(Math.pow(radiatorTemp_K, 4) - Math.pow(sinkTemp_K, 4));
+const radiatorArea_m2 = radPower_per_m2 > 0 ? wasteHeat_W / radPower_per_m2 : Infinity;
+const radiatorMass_kg = radiatorArea_m2 * radiatorDensity;
+const radiatorLaunchCost = radiatorMass_kg * launchCost;
+const usefulPower_W = computePower_W * efficiency;
+const totalFLOPS = usefulPower_W * computeDensity * 1e9;
+const totalPFLOPS = totalFLOPS / 1e15;
+const costPerPFLOPS = totalPFLOPS > 0 ? radiatorLaunchCost / totalPFLOPS : Infinity;
+const solarLoad_W = radiatorArea_m2 * SOLAR_FLUX_LEO * (1 - emissivity) * 0.5;
+return {
+wasteHeat_W, radPower_per_m2, radiatorArea_m2, radiatorMass_kg,
+radiatorLaunchCost, totalFLOPS, totalPFLOPS, costPerPFLOPS, solarLoad_W,
+netCoolingCapacity_W: (radPower_per_m2 * radiatorArea_m2) - solarLoad_W,
+};
+}
+
+// ─── COMMS ENGINE ─────────────────────────────────────────────
+// Thermal radiator as mid-IR phased array
+// Peak emission wavelength: Wien’s law λ_peak = 2898 / T (μm)
+// Beam solid angle for aperture: Ω ≈ λ² / A_eff
+// Channel capacity: Shannon–Hartley with thermal noise
+
+function computeCommsState(thermalState, commsParams) {
+const {
+radiatorTemp_K, radiatorArea_m2,
+} = thermalState;
+const {
+distance_km, receiverArea_m2, receiverTemp_K,
+spectralEfficiency, modulationBW_GHz, beamFillFactor,
+} = commsParams;
+
+const distance_m = distance_km * 1000;
+
+// Wien peak wavelength
+const lambda_peak_m = 2.898e-3 / radiatorTemp_K;
+const lambda_peak_um = lambda_peak_m * 1e6;
+const freq_peak = SPEED_C / lambda_peak_m;
+
+// Effective aperture with beam fill factor
+// (how much of the radiator area acts as coherent aperture)
+const A_eff = radiatorArea_m2 * beamFillFactor;
+
+// Transmit beam solid angle (diffraction limit)
+const beamSolidAngle = Math.pow(lambda_peak_m, 2) / A_eff;
+const beamDivergence_rad = Math.sqrt(beamSolidAngle);
+const beamDivergence_arcsec = beamDivergence_rad * 206265;
+
+// Beam spot area at distance
+const spotArea_m2 = beamSolidAngle * Math.pow(distance_m, 2);
+
+// Fraction of beam captured by receiver
+const capturedFraction = Math.min(1, receiverArea_m2 / spotArea_m2);
+
+// Spectral radiance in bandwidth (Planck)
+// Power in BW around peak
+const BW_Hz = modulationBW_GHz * 1e9;
+
+// Radiated power in bandwidth from the aperture
+// Spectral radiance: B_ν = (2hν³/c²) / (exp(hν/kT) - 1)
+const hv_kT = (PLANCK_H * freq_peak) / (BOLTZMANN_K * radiatorTemp_K);
+const spectralRadiance = (2 * PLANCK_H * Math.pow(freq_peak, 3) / Math.pow(SPEED_C, 2)) /
+(Math.exp(hv_kT) - 1);
+
+// Power into beam within bandwidth
+// P = B_ν × A_eff × Ω_beam × Δν × spectral_efficiency
+const totalRadPower_inBand = spectralRadiance * A_eff * beamSolidAngle * BW_Hz * spectralEfficiency;
+
+// But actually, for directed emission:
+// P_directed = B_ν × A_eff × Δν × spectral_efficiency (into the beam)
+const directedPower_W = spectralRadiance * A_eff * BW_Hz * spectralEfficiency;
+
+// Received power
+const receivedPower_W = directedPower_W * capturedFraction;
+
+// Noise: receiver thermal noise floor
+const noisePower_W = BOLTZMANN_K * receiverTemp_K * BW_Hz;
+
+// SNR
+const SNR = receivedPower_W / noisePower_W;
+const SNR_dB = 10 * Math.log10(Math.max(SNR, 1e-20));
+
+// Shannon capacity
+const channelCapacity_bps = SNR > 0 ? BW_Hz * Math.log2(1 + SNR) : 0;
+
+// ─── DEDICATED ANTENNA COMPARISON ───────────────────────────
+// Standard X-band (8 GHz) high-gain antenna for same mission
+const xband_freq = 8e9;
+const xband_lambda = SPEED_C / xband_freq;
+const xband_dish_diameter = 3.0; // m, typical large spacecraft antenna
+const xband_area = PI * Math.pow(xband_dish_diameter / 2, 2);
+const xband_gain = (4 * PI * xband_area) / Math.pow(xband_lambda, 2);
+const xband_power_W = 100; // typical TWTA
+const xband_EIRP = xband_power_W * xband_gain;
+const xband_spreadArea = 4 * PI * Math.pow(distance_m, 2);
+const xband_fluxAtReceiver = xband_EIRP / xband_spreadArea;
+const xband_receivedPower = xband_fluxAtReceiver * receiverArea_m2;
+const xband_BW = 500e6; // 500 MHz typical
+const xband_noise = BOLTZMANN_K * receiverTemp_K * xband_BW;
+const xband_SNR = xband_receivedPower / xband_noise;
+const xband_capacity_bps = xband_BW * Math.log2(1 + Math.max(xband_SNR, 0));
+const xband_mass_kg = 45; // dish + TWTA + electronics
+const xband_cost = xband_mass_kg * (commsParams.launchCost || 2700);
+
+// Dual-use mass savings
+// Extra mass for metamaterial emitter layer on radiator
+const metamaterialOverhead_kg_per_m2 = 0.3;
+const dualUseMassOverhead = radiatorArea_m2 * metamaterialOverhead_kg_per_m2;
+const massSaved_kg = xband_mass_kg - dualUseMassOverhead;
+
+return {
+lambda_peak_um, freq_peak, beamDivergence_arcsec,
+spotArea_m2, capturedFraction,
+directedPower_W, receivedPower_W, noisePower_W,
+SNR, SNR_dB, channelCapacity_bps, A_eff,
+// comparison
+xband_capacity_bps, xband_mass_kg, xband_cost, xband_SNR_dB: 10 * Math.log10(Math.max(xband_SNR, 1e-20)),
+dualUseMassOverhead, massSaved_kg,
+// ratios
+capacityRatio: channelCapacity_bps / (xband_capacity_bps || 1),
+massEfficiencyRatio: (channelCapacity_bps / (dualUseMassOverhead || 1)) /
+((xband_capacity_bps || 1) / xband_mass_kg),
+};
+}
+
+function sweepCommsParam(thermalParams, thermalState, commsParams, paramKey, min, max, steps) {
+const results = [];
+for (let i = 0; i <= steps; i++) {
+const val = min + (max - min) * (i / steps);
+const cp = { …commsParams, [paramKey]: val };
+const ts = { radiatorTemp_K: thermalParams.radiatorTemp_K, radiatorArea_m2: thermalState.radiatorArea_m2 };
+const cs = computeCommsState(ts, cp);
+results.push({ x: val, …cs });
+}
+return results;
+}
+
+// ─── UI HELPERS ───────────────────────────────────────────────
+function fmt(n, digits = 1) {
+if (!isFinite(n)) return “∞”;
+if (Math.abs(n) >= 1e15) return (n / 1e15).toFixed(digits) + “P”;
+if (Math.abs(n) >= 1e12) return (n / 1e12).toFixed(digits) + “T”;
+if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(digits) + “G”;
+if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(digits) + “M”;
+if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(digits) + “k”;
+return n.toFixed(digits);
+}
+
+function fmtBits(bps) {
+if (!isFinite(bps) || bps <= 0) return “0 bps”;
+if (bps >= 1e12) return (bps / 1e12).toFixed(1) + “ Tbps”;
+if (bps >= 1e9) return (bps / 1e9).toFixed(1) + “ Gbps”;
+if (bps >= 1e6) return (bps / 1e6).toFixed(1) + “ Mbps”;
+if (bps >= 1e3) return (bps / 1e3).toFixed(1) + “ kbps”;
+return bps.toFixed(0) + “ bps”;
+}
+
+function fmtCost(n) {
+if (!isFinite(n)) return “∞”;
+if (n >= 1e9) return “$” + (n / 1e9).toFixed(1) + “B”;
+if (n >= 1e6) return “$” + (n / 1e6).toFixed(1) + “M”;
+if (n >= 1e3) return “$” + (n / 1e3).toFixed(1) + “k”;
+return “$” + n.toFixed(0);
+}
+
+// ─── SVG MINI CHART ───────────────────────────────────────────
+function MiniChart({ data, xKey, yKey, xLabel, yLabel, color, highlight, logY }) {
+const W = 300, H = 130, PAD = 32;
+const xs = data.map(d => d[xKey]);
+const rawYs = data.map(d => isFinite(d[yKey]) ? d[yKey] : 0);
+const ys = logY ? rawYs.map(v => v > 0 ? Math.log10(v) : 0) : rawYs;
+const xMin = Math.min(…xs), xMax = Math.max(…xs);
+const yMin = Math.min(…ys), yMax = Math.max(…ys);
+const sx = (v) => PAD + ((v - xMin) / (xMax - xMin || 1)) * (W - PAD * 2);
+const sy = (v) => H - PAD - ((v - yMin) / (yMax - yMin || 1)) * (H - PAD * 2);
+
+const pathD = data.map((d, i) => {
+const x = sx(d[xKey]);
+const raw = isFinite(d[yKey]) ? d[yKey] : 0;
+const y = sy(logY ? (raw > 0 ? Math.log10(raw) : 0) : raw);
+return `${i === 0 ? "M" : "L"}${x},${y}`;
+}).join(” “);
+
+const hIdx = data.reduce((best, d, i) =>
+Math.abs(d[xKey] - highlight) < Math.abs(data[best][xKey] - highlight) ? i : best, 0);
+const hx = sx(data[hIdx][xKey]);
+const hRaw = isFinite(data[hIdx][yKey]) ? data[hIdx][yKey] : 0;
+const hy = sy(logY ? (hRaw > 0 ? Math.log10(hRaw) : 0) : hRaw);
+
+return (
+<svg viewBox={`0 0 ${W} ${H}`} style={{ width: “100%”, maxWidth: 340, height: “auto” }}>
+{[0.25, 0.5, 0.75].map(f => (
+<line key={f} x1={PAD} x2={W - PAD}
+y1={sy(yMin + f * (yMax - yMin))} y2={sy(yMin + f * (yMax - yMin))}
+stroke=”#1a2a3a” strokeWidth={0.5} />
+))}
+<path d={pathD} fill="none" stroke={color} strokeWidth={2} opacity={0.9} />
+<path d={pathD} fill="none" stroke={color} strokeWidth={5} opacity={0.15} />
+<circle cx={hx} cy={hy} r={5} fill={color} opacity={0.9} />
+<circle cx={hx} cy={hy} r={9} fill={color} opacity={0.2} />
+<text x={W / 2} y={H - 4} textAnchor=“middle” fill=”#5a7a8a” fontSize={9} fontFamily=“monospace”>{xLabel}</text>
+<text x={4} y={H / 2} textAnchor=“middle” fill=”#5a7a8a” fontSize={9} fontFamily=“monospace”
+transform={`rotate(-90, 4, ${H / 2})`}>{yLabel}{logY ? “ (log)” : “”}</text>
+<text x={PAD} y={H - PAD + 12} textAnchor=“start” fill=”#3a5a6a” fontSize={8} fontFamily=“monospace”>{fmt(xMin, 0)}</text>
+<text x={W - PAD} y={H - PAD + 12} textAnchor=“end” fill=”#3a5a6a” fontSize={8} fontFamily=“monospace”>{fmt(xMax, 0)}</text>
+</svg>
+);
+}
+
+// ─── BAR COMPARISON ───────────────────────────────────────────
+function CompBar({ label1, val1, label2, val2, color1, color2, unit }) {
+const maxVal = Math.max(Math.abs(val1), Math.abs(val2), 1);
+return (
+<div style={{ marginBottom: 8 }}>
+<div style={{ display: “flex”, justifyContent: “space-between”, fontSize: 9, color: “#4a6a7a”, marginBottom: 3 }}>
+<span>{label1}: <span style={{ color: color1, fontWeight: 600 }}>{unit(val1)}</span></span>
+<span>{label2}: <span style={{ color: color2, fontWeight: 600 }}>{unit(val2)}</span></span>
+</div>
+<div style={{ display: “flex”, gap: 2, height: 12, borderRadius: 3, overflow: “hidden”, background: “#0a0e14” }}>
+<div style={{
+width: `${(Math.abs(val1) / maxVal) * 100}%`,
+background: `linear-gradient(90deg, ${color1}40, ${color1})`,
+borderRadius: “3px 0 0 3px”, minWidth: 2, transition: “width 0.3s”,
+}} />
+<div style={{
+width: `${(Math.abs(val2) / maxVal) * 100}%`,
+background: `linear-gradient(90deg, ${color2}40, ${color2})`,
+borderRadius: “0 3px 3px 0”, minWidth: 2, transition: “width 0.3s”,
+}} />
+</div>
+</div>
+);
+}
+
+// ─── PARAM DEFINITIONS ────────────────────────────────────────
+const THERMAL_PARAMS = [
+{ key: “computePower_kW”, label: “Compute Power”, unit: “kW”, min: 10, max: 5000, step: 10, default: 500 },
+{ key: “efficiency”, label: “Efficiency”, unit: “”, min: 0.05, max: 0.95, step: 0.01, default: 0.35 },
+{ key: “radiatorTemp_K”, label: “Radiator Temp”, unit: “K”, min: 250, max: 600, step: 5, default: 350 },
+{ key: “emissivity”, label: “Emissivity ε”, unit: “”, min: 0.5, max: 0.98, step: 0.01, default: 0.92 },
+{ key: “sinkTemp_K”, label: “Sink Temp”, unit: “K”, min: 3, max: 380, step: 1, default: 3 },
+{ key: “radiatorDensity”, label: “Radiator Mass”, unit: “kg/m²”, min: 1, max: 20, step: 0.5, default: 5 },
+{ key: “launchCost”, label: “Launch Cost”, unit: “$/kg”, min: 100, max: 10000, step: 100, default: 2700 },
+{ key: “computeDensity”, label: “Compute Density”, unit: “GFLOPS/W”, min: 1, max: 200, step: 1, default: 50 },
+];
+
+const COMMS_PARAMS = [
+{ key: “distance_km”, label: “Distance”, unit: “km”, min: 400, max: 400000, step: 100, default: 36000 },
+{ key: “receiverArea_m2”, label: “Receiver Area”, unit: “m²”, min: 0.1, max: 100, step: 0.1, default: 10 },
+{ key: “receiverTemp_K”, label: “Receiver Temp”, unit: “K”, min: 4, max: 300, step: 1, default: 50 },
+{ key: “spectralEfficiency”, label: “Spectral Eff”, unit: “”, min: 0.01, max: 0.5, step: 0.01, default: 0.1 },
+{ key: “modulationBW_GHz”, label: “Modulation BW”, unit: “GHz”, min: 0.1, max: 100, step: 0.1, default: 10 },
+{ key: “beamFillFactor”, label: “Beam Fill”, unit: “”, min: 0.01, max: 1.0, step: 0.01, default: 0.1 },
+];
+
+const PRESETS = {
+“LEO Free-Flyer”: { computePower_kW: 500, efficiency: 0.35, radiatorTemp_K: 350, emissivity: 0.92, sinkTemp_K: 3, radiatorDensity: 5, launchCost: 2700, computeDensity: 50 },
+“Lunar Surface”: { computePower_kW: 200, efficiency: 0.30, radiatorTemp_K: 400, emissivity: 0.90, sinkTemp_K: 280, radiatorDensity: 8, launchCost: 5000, computeDensity: 50 },
+“L2 Deep Space”: { computePower_kW: 1000, efficiency: 0.40, radiatorTemp_K: 300, emissivity: 0.95, sinkTemp_K: 3, radiatorDensity: 3, launchCost: 4000, computeDensity: 80 },
+“Mars Surface”: { computePower_kW: 100, efficiency: 0.25, radiatorTemp_K: 350, emissivity: 0.88, sinkTemp_K: 210, radiatorDensity: 10, launchCost: 8000, computeDensity: 30 },
+};
+
+const COMMS_PRESETS = {
+“LEO→Ground”: { distance_km: 400, receiverArea_m2: 10, receiverTemp_K: 50, spectralEfficiency: 0.1, modulationBW_GHz: 10, beamFillFactor: 0.1 },
+“GEO→Ground”: { distance_km: 36000, receiverArea_m2: 10, receiverTemp_K: 50, spectralEfficiency: 0.1, modulationBW_GHz: 10, beamFillFactor: 0.1 },
+“Moon→Earth”: { distance_km: 384400, receiverArea_m2: 50, receiverTemp_K: 20, spectralEfficiency: 0.05, modulationBW_GHz: 5, beamFillFactor: 0.15 },
+“L2→Earth”: { distance_km: 1500000, receiverArea_m2: 80, receiverTemp_K: 10, spectralEfficiency: 0.05, modulationBW_GHz: 2, beamFillFactor: 0.2 },
+};
+
+// ─── MAIN ─────────────────────────────────────────────────────
+export default function ThermalCommsPhaseSpace() {
+const [tab, setTab] = useState(“thermal”); // thermal | comms | compare
+const [tParams, setTParams] = useState(PRESETS[“LEO Free-Flyer”]);
+const [cParams, setCParams] = useState(COMMS_PRESETS[“GEO→Ground”]);
+const [activePreset, setActivePreset] = useState(“LEO Free-Flyer”);
+const [activeCommsPreset, setActiveCommsPreset] = useState(“GEO→Ground”);
+const [sweepParam, setSweepParam] = useState(“radiatorTemp_K”);
+const [commsSweep, setCommsSweep] = useState(“distance_km”);
+
+const setTP = useCallback((k, v) => { setTParams(p => ({ …p, [k]: v })); setActivePreset(null); }, []);
+const setCP = useCallback((k, v) => { setCParams(p => ({ …p, [k]: v })); setActiveCommsPreset(null); }, []);
+
+const thermal = useMemo(() => computeThermalState(tParams), [tParams]);
+const comms = useMemo(() =>
+computeCommsState(
+{ radiatorTemp_K: tParams.radiatorTemp_K, radiatorArea_m2: thermal.radiatorArea_m2 },
+{ …cParams, launchCost: tParams.launchCost }
+), [tParams, thermal, cParams]);
+
+const sweepDef = THERMAL_PARAMS.find(p => p.key === sweepParam);
+const thermalSweep = useMemo(() => {
+const results = [];
+for (let i = 0; i <= 80; i++) {
+const val = sweepDef.min + (sweepDef.max - sweepDef.min) * (i / 80);
+const p = { …tParams, [sweepParam]: val };
+results.push({ x: val, …computeThermalState(p) });
+}
+return results;
+}, [tParams, sweepParam, sweepDef]);
+
+const commsSweepDef = COMMS_PARAMS.find(p => p.key === commsSweep);
+const commsSweepData = useMemo(() =>
+sweepCommsParam(tParams, thermal, cParams, commsSweep, commsSweepDef.min, commsSweepDef.max, 80),
+[tParams, thermal, cParams, commsSweep, commsSweepDef]);
+
+const viability = thermal.netCoolingCapacity_W > 0
+? thermal.netCoolingCapacity_W > thermal.wasteHeat_W * 0.5 ? “viable” : “marginal”
+: “fail”;
+const vColor = { viable: “#00ffaa”, marginal: “#ffaa00”, fail: “#ff4444” }[viability];
+
+const S = { // shared styles
+box: { background: “#0d1520”, border: “1px solid #1a2a3a”, borderRadius: 4, padding: “6px 8px” },
+label: { fontSize: 9, color: “#3a5a6a”, textTransform: “uppercase”, letterSpacing: 1 },
+val: { fontSize: 14, color: “#e0f0f4”, fontWeight: 600, marginTop: 2 },
+sub: { fontSize: 9, color: “#4a6a7a”, marginTop: 1 },
+slider: { width: “100%”, height: 20, accentColor: “#00ccaa”, cursor: “pointer” },
+};
+
+const tabStyle = (t) => ({
+flex: 1, padding: “8px 0”, textAlign: “center”, fontSize: 11, fontWeight: 600,
+color: tab === t ? “#00ccaa” : “#3a5a6a”,
+background: tab === t ? “#00ccaa10” : “transparent”,
+borderBottom: tab === t ? “2px solid #00ccaa” : “2px solid #1a2a3a”,
+cursor: “pointer”, fontFamily: “inherit”, border: “none”,
+borderBottomStyle: “solid”, borderBottomWidth: 2,
+borderBottomColor: tab === t ? “#00ccaa” : “#1a2a3a”,
+});
+
+return (
+<div style={{
+background: “#0a0e14”, color: “#c0d0d8”, minHeight: “100vh”,
+fontFamily: “‘JetBrains Mono’, ‘Fira Code’, ‘SF Mono’, monospace”,
+fontSize: 13, padding: “12px 10px”, maxWidth: 420, margin: “0 auto”,
+}}>
+{/* Header */}
+<div style={{ borderBottom: “1px solid #1a2a3a”, paddingBottom: 8, marginBottom: 10 }}>
+<div style={{ fontSize: 15, color: “#00ccaa”, fontWeight: 700, letterSpacing: 1 }}>
+THERMAL ↔ COMMS PHASE SPACE
+</div>
+<div style={{ fontSize: 10, color: “#3a5a6a”, marginTop: 2 }}>
+Dual-use radiator: heat rejection + mid-IR downlink
+</div>
+</div>
+
+```
+  {/* Tabs */}
+  <div style={{ display: "flex", marginBottom: 12 }}>
+    <button onClick={() => setTab("thermal")} style={tabStyle("thermal")}>THERMAL</button>
+    <button onClick={() => setTab("comms")} style={tabStyle("comms")}>COMMS</button>
+    <button onClick={() => setTab("compare")} style={tabStyle("compare")}>DUAL-USE</button>
+  </div>
+
+  {/* ═══════════ THERMAL TAB ═══════════ */}
+  {tab === "thermal" && <>
+    {/* Presets */}
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 12 }}>
+      {Object.keys(PRESETS).map(name => (
+        <button key={name} onClick={() => { setTParams(PRESETS[name]); setActivePreset(name); }}
+          style={{
+            background: activePreset === name ? "#00ccaa15" : "#0d1520",
+            border: `1px solid ${activePreset === name ? "#00ccaa" : "#1a2a3a"}`,
+            color: activePreset === name ? "#00ccaa" : "#5a7a8a",
+            borderRadius: 4, padding: "4px 7px", fontSize: 10, cursor: "pointer", fontFamily: "inherit",
+          }}>{name}</button>
+      ))}
+    </div>
+
+    {/* Status */}
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 12 }}>
+      {[
+        { l: "Radiator", v: fmt(thermal.radiatorArea_m2, 0) + " m²", s: fmt(thermal.radiatorMass_kg, 0) + " kg" },
+        { l: "Waste Heat", v: fmt(thermal.wasteHeat_W) + "W", s: ((1 - tParams.efficiency) * 100).toFixed(0) + "%" },
+        { l: "Compute", v: thermal.totalPFLOPS.toFixed(1) + " PFLOPS", s: fmt(thermal.totalFLOPS) + "FLOPS" },
+        { l: "Launch", v: fmtCost(thermal.radiatorLaunchCost), s: fmtCost(thermal.costPerPFLOPS) + "/PFLOPS" },
+      ].map(({ l, v, s }) => (
+        <div key={l} style={S.box}>
+          <div style={S.label}>{l}</div>
+          <div style={S.val}>{v}</div>
+          <div style={S.sub}>{s}</div>
+        </div>
+      ))}
+    </div>
+
+    <div style={{ ...S.box, display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+      <div style={{ width: 8, height: 8, borderRadius: "50%", background: vColor, boxShadow: `0 0 8px ${vColor}60` }} />
+      <span style={{ color: vColor, fontSize: 11, fontWeight: 600 }}>{viability.toUpperCase()}</span>
+      <span style={{ color: "#4a6a7a", fontSize: 10 }}>
+        {fmt(thermal.radPower_per_m2, 0)} W/m²
+      </span>
+    </div>
+
+    {/* Sweep */}
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+      <span style={S.label}>SWEEP:</span>
+      <select value={sweepParam} onChange={e => setSweepParam(e.target.value)}
+        style={{ background: "#0d1520", border: "1px solid #1a2a3a", color: "#00ccaa", borderRadius: 4, padding: "3px 6px", fontSize: 10, fontFamily: "inherit" }}>
+        {THERMAL_PARAMS.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+      </select>
+    </div>
+    <MiniChart data={thermalSweep} xKey="x" yKey="radiatorArea_m2"
+      xLabel={sweepDef.label} yLabel="Rad Area m²" color="#00ccaa" highlight={tParams[sweepParam]} />
+    <MiniChart data={thermalSweep} xKey="x" yKey="costPerPFLOPS"
+      xLabel={sweepDef.label} yLabel="$/PFLOPS" color="#ff6644" highlight={tParams[sweepParam]} />
+
+    {/* Sliders */}
+    <div style={{ marginTop: 12 }}>
+      <div style={{ ...S.label, marginBottom: 8 }}>PARAMETERS</div>
+      {THERMAL_PARAMS.map(({ key, label, unit, min, max, step }) => (
+        <div key={key} style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+            <span style={{ fontSize: 10, color: "#5a7a8a" }}>{label}</span>
+            <span style={{ fontSize: 10, color: "#00ccaa", fontWeight: 600 }}>{tParams[key]}{unit ? ` ${unit}` : ""}</span>
+          </div>
+          <input type="range" min={min} max={max} step={step} value={tParams[key]}
+            onChange={e => setTP(key, parseFloat(e.target.value))} style={S.slider} />
+        </div>
+      ))}
+    </div>
+  </>}
+
+  {/* ═══════════ COMMS TAB ═══════════ */}
+  {tab === "comms" && <>
+    {/* Comms presets */}
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 12 }}>
+      {Object.keys(COMMS_PRESETS).map(name => (
+        <button key={name} onClick={() => { setCParams(COMMS_PRESETS[name]); setActiveCommsPreset(name); }}
+          style={{
+            background: activeCommsPreset === name ? "#4488ff15" : "#0d1520",
+            border: `1px solid ${activeCommsPreset === name ? "#4488ff" : "#1a2a3a"}`,
+            color: activeCommsPreset === name ? "#4488ff" : "#5a7a8a",
+            borderRadius: 4, padding: "4px 7px", fontSize: 10, cursor: "pointer", fontFamily: "inherit",
+          }}>{name}</button>
+      ))}
+    </div>
+
+    {/* Comms status */}
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 12 }}>
+      {[
+        { l: "λ peak", v: comms.lambda_peak_um.toFixed(1) + " μm", s: fmt(comms.freq_peak) + " Hz" },
+        { l: "Beam Div", v: comms.beamDivergence_arcsec.toFixed(2) + "\"", s: fmt(comms.A_eff, 0) + " m² eff" },
+        { l: "Rx Power", v: fmt(comms.receivedPower_W) + "W", s: "SNR " + comms.SNR_dB.toFixed(1) + " dB" },
+        { l: "Capacity", v: fmtBits(comms.channelCapacity_bps), s: "Shannon limit" },
+      ].map(({ l, v, s }) => (
+        <div key={l} style={S.box}>
+          <div style={{ ...S.label, color: "#2a5a8a" }}>{l}</div>
+          <div style={{ ...S.val, color: "#88ccff" }}>{v}</div>
+          <div style={S.sub}>{s}</div>
+        </div>
+      ))}
+    </div>
+
+    {/* Link budget */}
+    <div style={{ ...S.box, marginBottom: 12 }}>
+      <div style={{ ...S.label, color: "#2a5a8a", marginBottom: 6 }}>LINK BUDGET</div>
+      {[
+        { l: "Directed Power", v: fmt(comms.directedPower_W) + "W" },
+        { l: "Capture Frac", v: (comms.capturedFraction * 100).toFixed(4) + "%" },
+        { l: "Rx Power", v: fmt(comms.receivedPower_W) + "W" },
+        { l: "Noise Floor", v: fmt(comms.noisePower_W) + "W" },
+        { l: "SNR", v: comms.SNR_dB.toFixed(1) + " dB" },
+      ].map(({ l, v }) => (
+        <div key={l} style={{ display: "flex", justifyContent: "space-between", fontSize: 10, padding: "2px 0", borderBottom: "1px solid #0a0e14" }}>
+          <span style={{ color: "#4a6a7a" }}>{l}</span>
+          <span style={{ color: "#88ccff", fontWeight: 600 }}>{v}</span>
+        </div>
+      ))}
+    </div>
+
+    {/* Sweep */}
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+      <span style={{ ...S.label, color: "#2a5a8a" }}>SWEEP:</span>
+      <select value={commsSweep} onChange={e => setCommsSweep(e.target.value)}
+        style={{ background: "#0d1520", border: "1px solid #1a2a3a", color: "#4488ff", borderRadius: 4, padding: "3px 6px", fontSize: 10, fontFamily: "inherit" }}>
+        {COMMS_PARAMS.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+      </select>
+    </div>
+    <MiniChart data={commsSweepData} xKey="x" yKey="channelCapacity_bps"
+      xLabel={commsSweepDef.label} yLabel="Capacity bps" color="#4488ff" highlight={cParams[commsSweep]} logY />
+    <MiniChart data={commsSweepData} xKey="x" yKey="SNR_dB"
+      xLabel={commsSweepDef.label} yLabel="SNR dB" color="#ffaa44" highlight={cParams[commsSweep]} />
+
+    {/* Sliders */}
+    <div style={{ marginTop: 12 }}>
+      <div style={{ ...S.label, color: "#2a5a8a", marginBottom: 8 }}>LINK PARAMETERS</div>
+      {COMMS_PARAMS.map(({ key, label, unit, min, max, step }) => (
+        <div key={key} style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+            <span style={{ fontSize: 10, color: "#5a7a8a" }}>{label}</span>
+            <span style={{ fontSize: 10, color: "#4488ff", fontWeight: 600 }}>{cParams[key]}{unit ? ` ${unit}` : ""}</span>
+          </div>
+          <input type="range" min={min} max={max} step={step} value={cParams[key]}
+            onChange={e => setCP(key, parseFloat(e.target.value))} style={{ ...S.slider, accentColor: "#4488ff" }} />
+        </div>
+      ))}
+    </div>
+  </>}
+
+  {/* ═══════════ DUAL-USE TAB ═══════════ */}
+  {tab === "compare" && <>
+    <div style={{ ...S.box, marginBottom: 12, borderColor: "#00ccaa40" }}>
+      <div style={{ ...S.label, color: "#00ccaa", marginBottom: 8 }}>
+        DUAL-USE vs DEDICATED X-BAND
+      </div>
+
+      <CompBar label1="Thermal IR" val1={comms.channelCapacity_bps}
+        label2="X-Band 3m" val2={comms.xband_capacity_bps}
+        color1="#00ccaa" color2="#ff6644"
+        unit={fmtBits} />
+
+      <CompBar label1="IR SNR" val1={comms.SNR_dB}
+        label2="X-Band SNR" val2={comms.xband_SNR_dB}
+        color1="#00ccaa" color2="#ff6644"
+        unit={v => v.toFixed(1) + " dB"} />
+
+      <CompBar label1="IR overhead" val1={comms.dualUseMassOverhead}
+        label2="X-Band mass" val2={comms.xband_mass_kg}
+        color1="#00ccaa" color2="#ff6644"
+        unit={v => v.toFixed(0) + " kg"} />
+    </div>
+
+    {/* Verdict */}
+    <div style={{ ...S.box, marginBottom: 12 }}>
+      <div style={{ ...S.label, marginBottom: 6 }}>MASS EFFICIENCY</div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <div>
+          <div style={{ fontSize: 9, color: "#4a6a7a" }}>bps/kg (thermal IR)</div>
+          <div style={{ fontSize: 16, color: "#00ccaa", fontWeight: 700 }}>
+            {comms.dualUseMassOverhead > 0 ? fmtBits(comms.channelCapacity_bps / comms.dualUseMassOverhead) : "∞"}/kg
+          </div>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 9, color: "#4a6a7a" }}>bps/kg (X-band)</div>
+          <div style={{ fontSize: 16, color: "#ff6644", fontWeight: 700 }}>
+            {fmtBits(comms.xband_capacity_bps / comms.xband_mass_kg)}/kg
+          </div>
+        </div>
+      </div>
+      <div style={{ marginTop: 8, fontSize: 10, color: comms.massEfficiencyRatio > 1 ? "#00ffaa" : "#ff6644", fontWeight: 600, textAlign: "center" }}>
+        {comms.massEfficiencyRatio > 1
+          ? `DUAL-USE WINS: ${comms.massEfficiencyRatio.toFixed(1)}× mass efficiency`
+          : `X-BAND WINS: ${(1 / comms.massEfficiencyRatio).toFixed(1)}× mass efficiency`}
+      </div>
+    </div>
+
+    {/* Mass budget breakdown */}
+    <div style={{ ...S.box, marginBottom: 12 }}>
+      <div style={{ ...S.label, marginBottom: 6 }}>MASS BUDGET</div>
+      {[
+        { l: "Radiator (already paid)", v: fmt(thermal.radiatorMass_kg, 0) + " kg", c: "#5a7a8a" },
+        { l: "Metamaterial layer (+)", v: comms.dualUseMassOverhead.toFixed(0) + " kg", c: "#00ccaa" },
+        { l: "X-Band system (avoided)", v: "-" + comms.xband_mass_kg + " kg", c: "#ff6644" },
+        { l: "Net savings", v: comms.massSaved_kg.toFixed(0) + " kg", c: comms.massSaved_kg > 0 ? "#00ffaa" : "#ff4444" },
+        { l: "Launch cost saved", v: fmtCost(comms.massSaved_kg * tParams.launchCost), c: comms.massSaved_kg > 0 ? "#00ffaa" : "#ff4444" },
+      ].map(({ l, v, c }) => (
+        <div key={l} style={{ display: "flex", justifyContent: "space-between", fontSize: 10, padding: "3px 0", borderBottom: "1px solid #0a0e14" }}>
+          <span style={{ color: "#4a6a7a" }}>{l}</span>
+          <span style={{ color: c, fontWeight: 600 }}>{v}</span>
+        </div>
+      ))}
+    </div>
+
+    {/* Where it works / doesn't */}
+    <div style={{ ...S.box, marginBottom: 12, fontSize: 10, color: "#4a6a7a", lineHeight: 1.6 }}>
+      <span style={{ color: "#00ccaa", fontWeight: 700 }}>WHERE IT WORKS: </span>
+      Large radiator area (high compute), short-medium distances, cryogenic receiver.
+      Beam fill factor is the critical unknown — metamaterial coherence determines
+      whether this is a flashlight or a laser.
+      <br /><br />
+      <span style={{ color: "#ff6644", fontWeight: 700 }}>WHERE IT BREAKS: </span>
+      Deep space (inverse square kills you), atmospheric absorption at mid-IR
+      (need space-based receiver or select atmospheric windows), and any scenario
+      where radiator temp modulation conflicts with thermal stability requirements.
+    </div>
+
+    {/* The key insight */}
+    <div style={{
+      background: "#00ccaa08", border: "1px solid #00ccaa30",
+      borderRadius: 4, padding: "8px 10px", fontSize: 10, color: "#6a9a8a", lineHeight: 1.6,
+    }}>
+      <span style={{ color: "#00ccaa", fontWeight: 700 }}>CORE INSIGHT: </span>
+      The radiator is a sunk-mass energy emitter. The only question is whether
+      you can impose enough structure on the emission to carry information.
+      At 1500m² you have aperture gain that no dedicated antenna can match at
+      these wavelengths. The bottleneck is coherence — how much of that area
+      acts as a phased array vs. a light bulb.
+    </div>
+  </>}
+
+  <div style={{ fontSize: 8, color: "#1a2a3a", textAlign: "center", padding: 12 }}>
+    Stefan-Boltzmann · Shannon-Hartley · Planck spectral radiance
+  </div>
+</div>
+```
+
+);
+}
