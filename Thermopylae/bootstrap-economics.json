@@ -1,0 +1,599 @@
+import { useState, useMemo, useCallback, useRef } from “react”;
+
+// ═══════════════════════════════════════════════════════════════
+// TORCH GENERATION SPECS
+// ═══════════════════════════════════════════════════════════════
+const TORCH_GENS = [
+{
+gen: 0, name: “Seed Torch”, mass_kg: 30, power_kW: 5,
+cutRate_kghr: 1, yield: 0.70, nozzleLife_hrs: 200,
+printRate_kghr: 0, canPrint: false, canReflow: false,
+cost_launched: 500000, // $500k for first seed torch
+notes: “Launched. W cathode + scrap Al anode. Ar vortex.”,
+},
+{
+gen: 1, name: “Self-Forged”, mass_kg: 25, power_kW: 15,
+cutRate_kghr: 5, yield: 0.80, nozzleLife_hrs: 500,
+printRate_kghr: 2, canPrint: true, canReflow: false,
+cost_launched: 0, // built from junk
+notes: “Al+WC nozzle. IR tracking. Slag → radiator panels.”,
+},
+{
+gen: 2, name: “Swarm-Spec”, mass_kg: 20, power_kW: 25,
+cutRate_kghr: 20, yield: 0.88, nozzleLife_hrs: 1000,
+printRate_kghr: 8, canPrint: true, canReflow: true,
+cost_launched: 0,
+notes: “Metamaterial nozzle. Forks: cutter/reflower/welder.”,
+},
+{
+gen: 3, name: “Apex Drone”, mass_kg: 15, power_kW: 40,
+cutRate_kghr: 50, yield: 0.95, nozzleLife_hrs: 5000,
+printRate_kghr: 20, canPrint: true, canReflow: true,
+cost_launched: 0,
+notes: “Microwave plasma. Self-healing. Mobile miner.”,
+},
+];
+
+// ═══════════════════════════════════════════════════════════════
+// NODE SPECS (what torches build)
+// ═══════════════════════════════════════════════════════════════
+const NODE_TYPES = {
+radiator: { name: “Radiator Node”, al_kg: 1200, build_hrs: 200, compute_kW: 5, cooling_kW: 85, rev_month: 5000 },
+compute: { name: “Compute Node”, al_kg: 600, build_hrs: 300, compute_kW: 50, cooling_kW: 25, rev_month: 15000 },
+seed: { name: “Seed Factory”, al_kg: 500, build_hrs: 400, compute_kW: 2, cooling_kW: 8, rev_month: 1000 },
+};
+
+// ═══════════════════════════════════════════════════════════════
+// BOOTSTRAP SIMULATION ENGINE
+// ═══════════════════════════════════════════════════════════════
+function simulateBootstrap(params, months) {
+const timeline = [];
+
+// State
+let torches = [{ gen: 0, age_hrs: 0, alive: true }];
+let al_stockpile_kg = 0;
+let nodes_built = { radiator: 0, compute: 0, seed: 0 };
+let total_captured_tons = 0;
+let total_revenue = 0;
+let total_cost = params.seedCost;
+let cumulative_revenue = 0;
+let self_funded_month = null;
+
+// Torch evolution tracking
+let highestGen = 0;
+let genUpgradeTrigger = params.upgradeYieldThreshold;
+
+const hoursPerMonth = 24 * 30 * params.dutyFraction; // operating hours
+
+for (let m = 1; m <= months; m++) {
+let monthCut_kg = 0;
+let monthPrint_kg = 0;
+let monthRevenue = 0;
+let torchesBuilt = 0;
+let nodesBuiltThisMonth = [];
+
+```
+// ── TORCH OPERATIONS ─────────────────────────────────────
+const aliveTorches = torches.filter(t => t.alive);
+const bestGen = Math.max(...aliveTorches.map(t => t.gen));
+
+for (const torch of aliveTorches) {
+  const spec = TORCH_GENS[torch.gen];
+
+  // Cut phase
+  const cutHrs = hoursPerMonth * 0.6; // 60% cutting
+  const cut_kg = spec.cutRate_kghr * cutHrs;
+  const usable_kg = cut_kg * spec.yield;
+  monthCut_kg += cut_kg;
+  al_stockpile_kg += usable_kg;
+  total_captured_tons += cut_kg / 1000;
+
+  // Aging
+  torch.age_hrs += hoursPerMonth;
+  if (torch.age_hrs > spec.nozzleLife_hrs) {
+    // Nozzle death — recycle 60% of torch mass
+    torch.alive = false;
+    al_stockpile_kg += spec.mass_kg * 0.6;
+  }
+}
+
+// ── EVOLUTION CHECK ──────────────────────────────────────
+// Average yield across fleet — if high enough, trigger upgrade
+const fleetYield = aliveTorches.length > 0
+  ? aliveTorches.reduce((s, t) => s + TORCH_GENS[t.gen].yield, 0) / aliveTorches.length
+  : 0;
+
+if (fleetYield > genUpgradeTrigger && highestGen < 3) {
+  highestGen = Math.min(3, highestGen + 1);
+  genUpgradeTrigger = Math.min(0.95, genUpgradeTrigger + 0.05);
+}
+
+// ── BUILD PHASE ──────────────────────────────────────────
+const printingTorches = aliveTorches.filter(t => TORCH_GENS[t.gen].canPrint);
+const printHrs = hoursPerMonth * 0.4; // 40% printing
+
+for (const torch of printingTorches) {
+  const spec = TORCH_GENS[torch.gen];
+  const printCapacity_kg = spec.printRate_kghr * printHrs;
+
+  // Priority: more torches first (if few), then nodes
+  const numAliveTorches = torches.filter(t => t.alive).length;
+
+  if (numAliveTorches < params.targetTorchCount && al_stockpile_kg > TORCH_GENS[highestGen].mass_kg * 2) {
+    // Build a torch
+    const tMass = TORCH_GENS[highestGen].mass_kg;
+    if (al_stockpile_kg >= tMass) {
+      // Print success rate: Gen 1 = 40%, Gen 2 = 70%, Gen 3 = 90%
+      const successRate = 0.3 + highestGen * 0.2;
+      const attempts = Math.ceil(1 / successRate);
+      const alNeeded = tMass * attempts;
+      if (al_stockpile_kg >= alNeeded) {
+        al_stockpile_kg -= alNeeded;
+        // Failed prints: recycle 60%
+        al_stockpile_kg += tMass * (attempts - 1) * 0.6;
+        torches.push({ gen: highestGen, age_hrs: 0, alive: true });
+        torchesBuilt++;
+      }
+    }
+  } else if (al_stockpile_kg > 1500) {
+    // Build a node
+    // Prefer compute if we have chip reflow capability
+    let nodeType;
+    if (spec.canReflow && nodes_built.compute < nodes_built.radiator * 2) {
+      nodeType = "compute";
+    } else if (nodes_built.seed < Math.floor((nodes_built.radiator + nodes_built.compute) / 8)) {
+      nodeType = "seed";
+    } else {
+      nodeType = "radiator";
+    }
+
+    const nodeSpec = NODE_TYPES[nodeType];
+    if (al_stockpile_kg >= nodeSpec.al_kg && printCapacity_kg >= nodeSpec.al_kg * 0.5) {
+      al_stockpile_kg -= nodeSpec.al_kg;
+      nodes_built[nodeType]++;
+      nodesBuiltThisMonth.push(nodeType);
+    }
+  }
+}
+
+// ── REVENUE ──────────────────────────────────────────────
+for (const [type, count] of Object.entries(nodes_built)) {
+  monthRevenue += NODE_TYPES[type].rev_month * count;
+}
+// Debris cleanup credits
+monthRevenue += total_captured_tons * params.debrisCredit_per_ton * 0.01;
+
+total_revenue += monthRevenue;
+cumulative_revenue += monthRevenue;
+
+// Self-funding check
+if (cumulative_revenue >= total_cost && self_funded_month === null) {
+  self_funded_month = m;
+}
+
+// Monthly costs (ground ops, insurance, etc)
+const monthlyCost = params.monthlyOps;
+total_cost += monthlyCost;
+
+// ── RECORD ───────────────────────────────────────────────
+const totalNodes = nodes_built.radiator + nodes_built.compute + nodes_built.seed;
+const totalCompute = nodes_built.compute * NODE_TYPES.compute.compute_kW +
+  nodes_built.radiator * NODE_TYPES.radiator.compute_kW +
+  nodes_built.seed * NODE_TYPES.seed.compute_kW;
+const totalCooling = nodes_built.compute * NODE_TYPES.compute.cooling_kW +
+  nodes_built.radiator * NODE_TYPES.radiator.cooling_kW +
+  nodes_built.seed * NODE_TYPES.seed.cooling_kW;
+const totalRadArea = nodes_built.radiator * 500 + nodes_built.compute * 150 + nodes_built.seed * 50;
+
+timeline.push({
+  month: m,
+  torches_alive: torches.filter(t => t.alive).length,
+  torches_total: torches.length,
+  highest_gen: highestGen,
+  fleet_yield: fleetYield,
+  al_stockpile: al_stockpile_kg,
+  monthCut_kg,
+  total_captured_tons,
+  nodes_radiator: nodes_built.radiator,
+  nodes_compute: nodes_built.compute,
+  nodes_seed: nodes_built.seed,
+  totalNodes,
+  totalCompute,
+  totalCooling,
+  totalRadArea,
+  monthRevenue,
+  cumRevenue: cumulative_revenue,
+  totalCost: total_cost,
+  netPosition: cumulative_revenue - total_cost,
+  self_funded: self_funded_month !== null,
+  torchesBuilt,
+  nodesBuilt: nodesBuiltThisMonth,
+  roi_pct: total_cost > 0 ? ((cumulative_revenue / total_cost) - 1) * 100 : 0,
+});
+```
+
+}
+
+return { timeline, self_funded_month };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UI
+// ═══════════════════════════════════════════════════════════════
+const fmt = (n, d = 1) => {
+if (!isFinite(n)) return “∞”;
+const a = Math.abs(n);
+if (a >= 1e9) return (n / 1e9).toFixed(d) + “B”;
+if (a >= 1e6) return (n / 1e6).toFixed(d) + “M”;
+if (a >= 1e3) return (n / 1e3).toFixed(d) + “k”;
+return n.toFixed(d);
+};
+const f$ = n => {
+if (Math.abs(n) >= 1e9) return “$” + (n / 1e9).toFixed(1) + “B”;
+if (Math.abs(n) >= 1e6) return “$” + (n / 1e6).toFixed(1) + “M”;
+if (Math.abs(n) >= 1e3) return “$” + (n / 1e3).toFixed(1) + “k”;
+return “$” + n.toFixed(0);
+};
+const fW = w => w >= 1e3 ? (w / 1e3).toFixed(1) + “ MW” : w.toFixed(0) + “ kW”;
+
+function Chart({ data, yKey, label, color, maxH = 70, showZero, f }) {
+if (data.length < 2) return null;
+const vals = data.map(d => d[yKey]);
+const minV = showZero ? Math.min(0, …vals) : Math.min(…vals);
+const maxV = Math.max(…vals, 1);
+const range = maxV - minV || 1;
+const W = 310, H = maxH, P = 3;
+const formatter = f || fmt;
+return (
+<div style={{ marginBottom: 6 }}>
+<div style={{ display: “flex”, justifyContent: “space-between”, fontSize: 8, color: “#4a6a7a”, marginBottom: 2 }}>
+<span style={{ color }}>{label}</span>
+<span>{formatter(vals[vals.length - 1])}</span>
+</div>
+<svg viewBox={`0 0 ${W} ${H}`} style={{ width: “100%”, maxWidth: 350, height: “auto” }}>
+{showZero && minV < 0 && (
+<line x1={P} x2={W - P}
+y1={H - P - (-minV / range) * (H - P * 2)}
+y2={H - P - (-minV / range) * (H - P * 2)}
+stroke=”#ffffff20” strokeWidth={0.5} strokeDasharray=“4,4” />
+)}
+<path d={
+data.map((d, i) => {
+const x = P + (i / (data.length - 1)) * (W - P * 2);
+const y = H - P - ((d[yKey] - minV) / range) * (H - P * 2);
+return `${i === 0 ? "M" : "L"}${x},${y}`;
+}).join(” “) + ` L${W - P},${H - P} L${P},${H - P} Z`
+} fill={`${color}12`} />
+<path d={
+data.map((d, i) => {
+const x = P + (i / (data.length - 1)) * (W - P * 2);
+const y = H - P - ((d[yKey] - minV) / range) * (H - P * 2);
+return `${i === 0 ? "M" : "L"}${x},${y}`;
+}).join(” “)
+} fill=“none” stroke={color} strokeWidth={1.5} />
+</svg>
+</div>
+);
+}
+
+function Sl({ k, label, unit, min, max, step, value, onChange, accent = “#00ccaa” }) {
+return (
+<div style={{ marginBottom: 7 }}>
+<div style={{ display: “flex”, justifyContent: “space-between”, marginBottom: 1 }}>
+<span style={{ fontSize: 9, color: “#5a7a8a” }}>{label}</span>
+<span style={{ fontSize: 9, color: accent, fontWeight: 600 }}>
+{Number.isInteger(step) && step >= 1 ? value : value.toFixed(2)}{unit ? ` ${unit}` : “”}
+</span>
+</div>
+<input type=“range” min={min} max={max} step={step} value={value}
+onChange={e => onChange(k, parseFloat(e.target.value))}
+style={{ width: “100%”, height: 18, accentColor: accent, cursor: “pointer” }} />
+</div>
+);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DEFAULTS
+// ═══════════════════════════════════════════════════════════════
+const DEFAULTS = {
+seedCost: 5000000,        // $5M seed launch (rideshare)
+monthlyOps: 50000,        // $50k/mo ground ops
+debrisCredit_per_ton: 1000000, // $1M/ton cleanup
+dutyFraction: 0.5,        // 50% of time operating
+targetTorchCount: 8,      // torch fleet target before node building
+upgradeYieldThreshold: 0.75,
+simMonths: 36,
+};
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════
+export default function BootstrapEconomics() {
+const [params, setParams] = useState(DEFAULTS);
+const [tab, setTab] = useState(“timeline”);
+const setP = useCallback((k, v) => setParams(p => ({ …p, [k]: v })), []);
+
+const sim = useMemo(() => simulateBootstrap(params, params.simMonths), [params]);
+const tl = sim.timeline;
+const latest = tl[tl.length - 1];
+
+const tabBtn = (t, label) => (
+<button onClick={() => setTab(t)} style={{
+flex: 1, padding: “6px 0”, textAlign: “center”, fontSize: 9, fontWeight: 600,
+color: tab === t ? “#00ccaa” : “#3a5a6a”, background: tab === t ? “#00ccaa08” : “transparent”,
+border: “none”, borderBottom: `2px solid ${tab === t ? "#00ccaa" : "#1a2a3a"}`,
+cursor: “pointer”, fontFamily: “inherit”,
+}}>{label}</button>
+);
+
+const genColors = [”#ff6644”, “#ffaa44”, “#00ccaa”, “#4488ff”];
+
+return (
+<div style={{
+background: “#0a0e14”, color: “#c0d0d8”, minHeight: “100vh”,
+fontFamily: “‘JetBrains Mono’,‘Fira Code’,‘SF Mono’,monospace”,
+fontSize: 13, padding: “12px 10px”, maxWidth: 420, margin: “0 auto”,
+}}>
+{/* Header */}
+<div style={{ borderBottom: “1px solid #1a2a3a”, paddingBottom: 8, marginBottom: 10 }}>
+<div style={{ fontSize: 13, color: “#00ccaa”, fontWeight: 700, letterSpacing: 1.5 }}>BOOTSTRAP ECONOMICS</div>
+<div style={{ fontSize: 9, color: “#3a5a6a”, marginTop: 2 }}>
+Seed → Torch Evolution → Swarm → Revenue → Self-Fund
+</div>
+</div>
+
+```
+  {/* Headline: self-funding month */}
+  <div style={{
+    background: "#0d1520", border: `1px solid ${sim.self_funded_month ? "#00ffaa" : "#ff4444"}30`,
+    borderRadius: 4, padding: "10px", marginBottom: 10, textAlign: "center",
+  }}>
+    {sim.self_funded_month ? (
+      <>
+        <div style={{ fontSize: 8, color: "#3a5a6a" }}>SELF-FUNDING AT</div>
+        <div style={{ fontSize: 28, color: "#00ffaa", fontWeight: 700 }}>MONTH {sim.self_funded_month}</div>
+        <div style={{ fontSize: 9, color: "#4a6a7a" }}>
+          ROI: {latest?.roi_pct.toFixed(0)}% · Net: {f$(latest?.netPosition || 0)}
+        </div>
+      </>
+    ) : (
+      <>
+        <div style={{ fontSize: 8, color: "#3a5a6a" }}>NOT YET SELF-FUNDING</div>
+        <div style={{ fontSize: 18, color: "#ff6644", fontWeight: 700 }}>
+          Net: {f$(latest?.netPosition || 0)}
+        </div>
+        <div style={{ fontSize: 9, color: "#4a6a7a" }}>Extend sim or adjust params</div>
+      </>
+    )}
+  </div>
+
+  {/* Quick stats */}
+  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4, marginBottom: 10 }}>
+    {[
+      { l: "MONTH", v: params.simMonths, c: "#ffffff" },
+      { l: "NODES", v: latest?.totalNodes || 0, c: "#00ccaa" },
+      { l: "COMPUTE", v: fW(latest?.totalCompute || 0), c: "#4488ff" },
+      { l: "GEN", v: latest?.highest_gen || 0, c: genColors[latest?.highest_gen || 0] },
+    ].map(({ l, v, c }) => (
+      <div key={l} style={{ background: "#0d1520", border: `1px solid ${c}20`, borderRadius: 4, padding: "4px", textAlign: "center" }}>
+        <div style={{ fontSize: 7, color: "#3a5a6a" }}>{l}</div>
+        <div style={{ fontSize: 13, color: c, fontWeight: 700 }}>{v}</div>
+      </div>
+    ))}
+  </div>
+
+  {/* Tabs */}
+  <div style={{ display: "flex", marginBottom: 10 }}>
+    {tabBtn("timeline", "TIMELINE")}
+    {tabBtn("torch", "TORCHES")}
+    {tabBtn("econ", "ECONOMICS")}
+    {tabBtn("config", "CONFIG")}
+  </div>
+
+  {/* ━━━ TIMELINE ━━━ */}
+  {tab === "timeline" && <>
+    <Chart data={tl} yKey="totalNodes" label="Nodes Built" color="#00ccaa" />
+    <Chart data={tl} yKey="torches_alive" label="Torches Alive" color="#ffaa44" />
+    <Chart data={tl} yKey="totalCompute" label="Total Compute (kW)" color="#4488ff" />
+    <Chart data={tl} yKey="total_captured_tons" label="Captured (tons)" color="#ff8844" />
+    <Chart data={tl} yKey="highest_gen" label="Highest Torch Gen" color="#ffcc00" maxH={40} />
+
+    {/* Generation milestones */}
+    <div style={{ background: "#0d1520", border: "1px solid #1a2a3a", borderRadius: 4, padding: "8px 10px", marginTop: 6 }}>
+      <div style={{ fontSize: 8, color: "#3a5a6a", marginBottom: 4 }}>EVOLUTION MILESTONES</div>
+      {tl.filter((t, i) => i === 0 || t.highest_gen > (tl[i - 1]?.highest_gen ?? -1)).map(t => (
+        <div key={t.month} style={{ display: "flex", gap: 6, marginBottom: 3, alignItems: "center" }}>
+          <div style={{
+            width: 20, height: 20, borderRadius: 3, background: `${genColors[t.highest_gen]}20`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 10, color: genColors[t.highest_gen], fontWeight: 700,
+          }}>G{t.highest_gen}</div>
+          <div>
+            <span style={{ fontSize: 9, color: genColors[t.highest_gen], fontWeight: 600 }}>
+              {TORCH_GENS[t.highest_gen].name}
+            </span>
+            <span style={{ fontSize: 8, color: "#4a6a7a", marginLeft: 6 }}>
+              Month {t.month} · {t.torches_alive} torches · {fmt(t.total_captured_tons, 0)}t captured
+            </span>
+          </div>
+        </div>
+      ))}
+    </div>
+  </>}
+
+  {/* ━━━ TORCHES ━━━ */}
+  {tab === "torch" && <>
+    {TORCH_GENS.map((tg, i) => {
+      const unlocked = latest && latest.highest_gen >= i;
+      const active = latest && tl.some(t => t.highest_gen >= i);
+      return (
+        <div key={i} style={{
+          background: "#0d1520", border: `1px solid ${unlocked ? genColors[i] : "#1a2a3a"}30`,
+          borderRadius: 4, padding: "8px 10px", marginBottom: 6,
+          opacity: unlocked ? 1 : 0.5,
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div style={{
+                width: 22, height: 22, borderRadius: 3, background: `${genColors[i]}20`,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: 11, color: genColors[i], fontWeight: 700,
+              }}>G{i}</div>
+              <span style={{ fontSize: 11, color: genColors[i], fontWeight: 700 }}>{tg.name}</span>
+            </div>
+            <span style={{ fontSize: 8, color: unlocked ? "#00ffaa" : "#3a5a6a" }}>
+              {unlocked ? "UNLOCKED" : "LOCKED"}
+            </span>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 4 }}>
+            {[
+              { l: "Mass", v: tg.mass_kg + " kg" },
+              { l: "Power", v: tg.power_kW + " kW" },
+              { l: "Cut Rate", v: tg.cutRate_kghr + " kg/hr" },
+            ].map(({ l, v }) => (
+              <div key={l} style={{ background: "#0a0e14", borderRadius: 2, padding: "3px 4px", textAlign: "center" }}>
+                <div style={{ fontSize: 7, color: "#3a5a6a" }}>{l}</div>
+                <div style={{ fontSize: 10, color: genColors[i], fontWeight: 600 }}>{v}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 4 }}>
+            {[
+              { l: "Yield", v: (tg.yield * 100).toFixed(0) + "%" },
+              { l: "Nozzle Life", v: tg.nozzleLife_hrs + " hrs" },
+              { l: "Print", v: tg.canPrint ? tg.printRate_kghr + " kg/hr" : "—" },
+            ].map(({ l, v }) => (
+              <div key={l} style={{ background: "#0a0e14", borderRadius: 2, padding: "3px 4px", textAlign: "center" }}>
+                <div style={{ fontSize: 7, color: "#3a5a6a" }}>{l}</div>
+                <div style={{ fontSize: 10, color: "#7a9aaa", fontWeight: 600 }}>{v}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 8, color: "#4a6a7a", lineHeight: 1.4 }}>{tg.notes}</div>
+        </div>
+      );
+    })}
+
+    {/* Evolution curve: cut rate × yield */}
+    <div style={{
+      background: "#0d1520", border: "1px solid #1a2a3a", borderRadius: 4,
+      padding: "8px 10px", marginTop: 6,
+    }}>
+      <div style={{ fontSize: 8, color: "#3a5a6a", marginBottom: 4 }}>
+        EFFECTIVE THROUGHPUT: cut rate × yield (kg usable/hr)
+      </div>
+      <div style={{ display: "flex", alignItems: "flex-end", gap: 8, height: 60 }}>
+        {TORCH_GENS.map((tg, i) => {
+          const throughput = tg.cutRate_kghr * tg.yield;
+          const maxT = TORCH_GENS[3].cutRate_kghr * TORCH_GENS[3].yield;
+          const h = Math.max(3, (throughput / maxT) * 56);
+          return (
+            <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+              <div style={{ fontSize: 8, color: genColors[i], fontWeight: 600 }}>
+                {throughput.toFixed(1)}
+              </div>
+              <div style={{
+                width: "100%", height: h, borderRadius: "3px 3px 0 0",
+                background: `linear-gradient(180deg, ${genColors[i]}, ${genColors[i]}40)`,
+              }} />
+              <div style={{ fontSize: 7, color: "#3a5a6a" }}>G{i}</div>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ fontSize: 8, color: "#4a6a7a", marginTop: 4, textAlign: "center" }}>
+        G0→G3: {(TORCH_GENS[3].cutRate_kghr * TORCH_GENS[3].yield / (TORCH_GENS[0].cutRate_kghr * TORCH_GENS[0].yield)).toFixed(0)}× throughput improvement
+      </div>
+    </div>
+  </>}
+
+  {/* ━━━ ECONOMICS ━━━ */}
+  {tab === "econ" && <>
+    <Chart data={tl} yKey="cumRevenue" label="Cumulative Revenue" color="#00ffaa" f={f$} />
+    <Chart data={tl} yKey="totalCost" label="Cumulative Cost" color="#ff4444" f={f$} />
+    <Chart data={tl} yKey="netPosition" label="Net Position" color={latest?.netPosition >= 0 ? "#00ffaa" : "#ff4444"} showZero f={f$} />
+    <Chart data={tl} yKey="monthRevenue" label="Monthly Revenue" color="#ffcc00" f={f$} />
+
+    {/* Revenue breakdown */}
+    {latest && (
+      <div style={{ background: "#0d1520", border: "1px solid #1a2a3a", borderRadius: 4, padding: "8px 10px", marginTop: 6 }}>
+        <div style={{ fontSize: 9, color: "#ffcc00", fontWeight: 700, marginBottom: 6 }}>REVENUE SOURCES (@ month {latest.month})</div>
+        {[
+          { l: "Compute nodes", v: latest.nodes_compute, rev: latest.nodes_compute * NODE_TYPES.compute.rev_month, c: "#4488ff" },
+          { l: "Radiator nodes", v: latest.nodes_radiator, rev: latest.nodes_radiator * NODE_TYPES.radiator.rev_month, c: "#00ccaa" },
+          { l: "Seed factories", v: latest.nodes_seed, rev: latest.nodes_seed * NODE_TYPES.seed.rev_month, c: "#ffcc00" },
+          { l: "Debris cleanup", v: fmt(latest.total_captured_tons, 0) + "t", rev: latest.total_captured_tons * params.debrisCredit_per_ton * 0.01, c: "#ff8844" },
+        ].map(({ l, v, rev, c }) => (
+          <div key={l} style={{ display: "flex", justifyContent: "space-between", fontSize: 9, padding: "3px 0", borderBottom: "1px solid #0a0e14" }}>
+            <span style={{ color: "#5a7a8a" }}>{l} ({v})</span>
+            <span style={{ color: c, fontWeight: 600 }}>{f$(rev)}/mo</span>
+          </div>
+        ))}
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, padding: "4px 0", marginTop: 2 }}>
+          <span style={{ color: "#ffffff", fontWeight: 700 }}>Total</span>
+          <span style={{ color: "#00ffaa", fontWeight: 700 }}>{f$(latest.monthRevenue)}/mo</span>
+        </div>
+      </div>
+    )}
+
+    {/* Key metrics */}
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginTop: 8 }}>
+      {[
+        { l: "Seed Investment", v: f$(params.seedCost), c: "#ff4444" },
+        { l: "Total Invested", v: f$(latest?.totalCost || 0), c: "#ff6644" },
+        { l: "Total Revenue", v: f$(latest?.cumRevenue || 0), c: "#00ffaa" },
+        { l: "ROI", v: (latest?.roi_pct || 0).toFixed(0) + "%", c: latest?.roi_pct > 0 ? "#00ffaa" : "#ff4444" },
+      ].map(({ l, v, c }) => (
+        <div key={l} style={{ background: "#0d1520", border: `1px solid ${c}20`, borderRadius: 4, padding: "5px 8px" }}>
+          <div style={{ fontSize: 8, color: "#3a5a6a" }}>{l}</div>
+          <div style={{ fontSize: 14, color: c, fontWeight: 700 }}>{v}</div>
+        </div>
+      ))}
+    </div>
+  </>}
+
+  {/* ━━━ CONFIG ━━━ */}
+  {tab === "config" && <>
+    {[
+      { title: "INVESTMENT", color: "#ff6644", ps: [
+        { key: "seedCost", label: "Seed Launch Cost", unit: "$", min: 500000, max: 50000000, step: 500000 },
+        { key: "monthlyOps", label: "Monthly Ops Cost", unit: "$/mo", min: 10000, max: 500000, step: 10000 },
+      ]},
+      { title: "REVENUE", color: "#00ffaa", ps: [
+        { key: "debrisCredit_per_ton", label: "Debris Credit", unit: "$/ton", min: 100000, max: 5000000, step: 100000 },
+      ]},
+      { title: "OPERATIONS", color: "#ffaa44", ps: [
+        { key: "dutyFraction", label: "Duty Fraction", unit: "", min: 0.1, max: 0.9, step: 0.05 },
+        { key: "targetTorchCount", label: "Target Torch Fleet", unit: "", min: 2, max: 20, step: 1 },
+        { key: "upgradeYieldThreshold", label: "Upgrade Threshold", unit: "", min: 0.6, max: 0.95, step: 0.05 },
+      ]},
+      { title: "SIMULATION", color: "#4488ff", ps: [
+        { key: "simMonths", label: "Months to Simulate", unit: "mo", min: 6, max: 60, step: 1 },
+      ]},
+    ].map(({ title, color, ps }) => (
+      <div key={title} style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: 9, color, fontWeight: 700, letterSpacing: 0.5, marginBottom: 5 }}>{title}</div>
+        {ps.map(p => <Sl key={p.key} {...p} value={params[p.key]} onChange={setP} accent={color} />)}
+      </div>
+    ))}
+
+    <div style={{
+      background: "#00ccaa06", border: "1px solid #00ccaa15", borderRadius: 4,
+      padding: "8px 10px", fontSize: 9, color: "#5a8a7a", lineHeight: 1.6,
+    }}>
+      <b style={{ color: "#00ccaa" }}>MODEL ASSUMPTIONS: </b>
+      Gen 1 print success rate 50% (5 nozzles → 1 good). Gen 2: 70%. Gen 3: 90%.
+      Failed prints recover 60% material. Nodes revenue: compute $15k/mo, radiator $5k/mo,
+      seed $1k/mo. Debris credits at 1% monthly realization rate.
+      Torch nozzle death recycles 60% of torch mass back to stockpile.
+    </div>
+  </>}
+
+  <div style={{ fontSize: 7, color: "#1a2a3a", textAlign: "center", padding: 10 }}>
+    Bootstrap Economics · Seed → Evolve → Revenue → Self-Fund
+  </div>
+</div>
+```
+
+);
+}
