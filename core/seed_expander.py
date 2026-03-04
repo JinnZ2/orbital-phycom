@@ -331,3 +331,13 @@ def quick_test():
 
 if __name__ == '__main__':
     quick_test()
+
+
+
+### potential extensions:  # Add SRP + J2 (in dynamics()):
+r_norm = np.linalg.norm(r)
+SRP_acc = -P_SRP * A/m * (r_unit - sun_dir)  # Solar radiation pressure
+J2_acc = J2_term(r, lat, alt)                 # Oblateness
+
+# Noise injection for sensitivity tests
+phase_rates += np.random.normal(0, solar_storm_noise, phase_rates.shape)
