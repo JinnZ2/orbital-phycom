@@ -1,0 +1,634 @@
+import { useState, useMemo, useCallback } from “react”;
+
+// ═══════════════════════════════════════════════════════════════
+// PHYSICS CONSTANTS
+// ═══════════════════════════════════════════════════════════════
+const σ = 5.670374419e-8;   // Stefan-Boltzmann W·m⁻²·K⁻⁴
+const k_B = 1.380649e-23;   // Boltzmann J/K
+const h = 6.62607015e-34;   // Planck J·s
+const c = 2.998e8;          // m/s
+const PI = Math.PI;
+
+// ═══════════════════════════════════════════════════════════════
+// LAYER 1: BULK RADIATOR (thermal job — unchanged)
+// ═══════════════════════════════════════════════════════════════
+function computeBulkRadiator(p) {
+const P_waste = p.computePower_kW * 1000 * (1 - p.efficiency);
+const q_rad = p.emissivity * σ * (Math.pow(p.radTemp_K, 4) - Math.pow(p.sinkTemp_K, 4));
+const A_total = q_rad > 0 ? P_waste / q_rad : Infinity;
+const mass_rad = A_total * p.radDensity_kgm2;
+return { P_waste, q_rad, A_total, mass_rad };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LAYER 2: GEOMETRIC CONCENTRATOR (horn/trough)
+// Narrows lobe, does NOT increase brightness above T_phys
+// Gain = A_aperture / A_throat (limited by diffraction)
+// Beam solid angle Ω = λ² / A_aperture
+// Power into beam = B_ν(T) × A_throat × Ω_beam × Δν
+//   but brightness B_ν capped at Planck @ T_emitter
+// ═══════════════════════════════════════════════════════════════
+function computeGeometricConcentrator(bulk, p) {
+// Wien peak for bulk radiator
+const λ_bulk = 2.898e-3 / p.radTemp_K;
+
+// Hot segment: dedicated comms surface run hotter
+const T_emit = p.hotSegmentTemp_K;
+const λ_emit = 2.898e-3 / T_emit;
+const ν_emit = c / λ_emit;
+
+// Hot segment area and thermal cost
+const A_hot = p.hotSegmentFraction * bulk.A_total;
+const q_hot = p.emissivity * σ * (Math.pow(T_emit, 4) - Math.pow(p.sinkTemp_K, 4));
+const P_hot_total = q_hot * A_hot; // total power radiated by hot segment
+
+// Horn geometry
+// N horns across the hot segment
+// Each horn: throat area A_t, aperture area A_ap
+// Geometric gain G = A_ap / A_t (capped by diffraction)
+const A_throat_single = p.throatWidth_m * p.throatWidth_m; // square throat
+const A_aperture_single = p.hornApertureWidth_m * p.hornApertureWidth_m;
+const G_geometric = A_aperture_single / A_throat_single;
+
+// Diffraction limit: max gain = 4π A_ap / λ²
+const G_diffraction = (4 * PI * A_aperture_single) / (λ_emit * λ_emit);
+const G_effective = Math.min(G_geometric, G_diffraction);
+
+// Number of horns that fit on hot segment
+const N_horns = Math.floor(A_hot / A_aperture_single) || 1;
+
+// Beam solid angle per horn
+const Ω_beam = (λ_emit * λ_emit) / A_aperture_single;
+const beamDiv_rad = Math.sqrt(Ω_beam);
+const beamDiv_arcsec = beamDiv_rad * 206265;
+const beamDiv_deg = beamDiv_rad * (180 / PI);
+
+// Spectral radiance at emitter temp (Planck, per unit freq)
+const hv_kT = (h * ν_emit) / (k_B * T_emit);
+const B_ν = (2 * h * Math.pow(ν_emit, 3) / (c * c)) / (Math.exp(hv_kT) - 1);
+
+// Power per horn into beam within modulation bandwidth
+// P_horn = B_ν × A_throat × Ω_beam_of_horn × Δν
+// But for a horn: the throat radiates into the horn’s solid angle
+// which IS the beam. So P_horn = B_ν × A_throat × Δν × (horn captures 2π→Ω)
+// Simplified: P per horn into forward lobe ≈ B_ν × A_aperture × Δν × Ω_beam
+// Actually: P_directed = B_ν × Δν × λ² (per spatial mode, per polarization)
+// With N_horns independent: P_total_directed = N_horns × B_ν × Δν × λ²
+const Δν = p.modBW_GHz * 1e9;
+const P_per_mode = B_ν * Δν * λ_emit * λ_emit; // single spatial mode
+const P_directed_total = N_horns * P_per_mode;
+
+// Combined beam: N_horns doesn’t narrow the beam further unless phased
+// Each horn independently beams in ~same direction (structural alignment)
+// Total power on target = N_horns × P_per_mode × (A_rx / spot_area)
+// Spot area at distance = Ω_beam × d²
+
+// Horn mass overhead
+const hornMass_per = p.hornMass_kg;
+const totalHornMass = N_horns * hornMass_per;
+
+return {
+λ_bulk_um: λ_bulk * 1e6,
+λ_emit_um: λ_emit * 1e6,
+ν_emit,
+T_emit,
+A_hot,
+P_hot_total,
+G_effective,
+G_diffraction,
+N_horns,
+Ω_beam,
+beamDiv_arcsec,
+beamDiv_deg,
+B_ν,
+P_per_mode,
+P_directed_total,
+totalHornMass,
+Δν,
+};
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LAYER 3: ACTIVE MODULATOR
+// Emissivity switching at throat → information encoding
+// Capacity = BW × log2(1 + SNR)
+// SNR limited by: thermal noise at receiver, modulation depth
+// ═══════════════════════════════════════════════════════════════
+function computeActiveModulator(geom, p) {
+const d_m = p.distance_km * 1000;
+
+// Spot area at distance (per horn)
+const spotArea = geom.Ω_beam * d_m * d_m;
+
+// Capture fraction
+const captureFrac = Math.min(1, p.rxArea_m2 / spotArea);
+
+// Received power (all horns, aligned)
+const P_rx = geom.P_directed_total * captureFrac;
+
+// Modulation: emissivity switches between ε_high and ε_low
+// Signal power = P_rx × modulation_depth
+const modDepth = p.modDepthFrac; // ε_high - ε_low / ε_high
+const P_signal = P_rx * modDepth;
+
+// Noise: receiver thermal + shot noise
+// Thermal: N = k_B × T_rx × BW
+const N_thermal = k_B * p.rxTemp_K * geom.Δν;
+
+// Shot noise (photon counting regime for mid-IR)
+// N_shot = h × ν × P_rx (simplified)
+const N_shot = h * geom.ν_emit * P_rx;
+
+const N_total = N_thermal + N_shot;
+
+const SNR = P_signal / N_total;
+const SNR_dB = 10 * Math.log10(Math.max(SNR, 1e-30));
+
+// Shannon capacity
+// But actual modulation rate limited by switching speed
+const switchRate_Hz = p.switchRate_kHz * 1000;
+// Nyquist: max symbol rate = switchRate
+// With OOK: ~1 bit per symbol at low SNR, log2(1+SNR) at high
+const bitsPerSymbol = Math.log2(1 + Math.max(SNR, 0));
+const capacity_bps = switchRate_Hz * bitsPerSymbol;
+
+// Shannon limit (if modulation could use full BW)
+const shannonLimit = geom.Δν * Math.log2(1 + Math.max(SNR, 0));
+
+// Modulator mass and power
+// VO₂ film: ~0.1 kg per throat, ~1W switching power
+// MEMS: ~0.05 kg, ~0.5W
+// Electrochromic: ~0.2 kg, ~0.1W
+const modMass = geom.N_horns * p.modMassPerThroat_kg;
+const modPower = geom.N_horns * p.modPowerPerThroat_W;
+
+// ─── X-BAND COMPARISON ───────────────────────────────────
+const xb_freq = 8e9;
+const xb_λ = c / xb_freq;
+const xb_dish = 3.0;
+const xb_A = PI * (xb_dish / 2) ** 2;
+const xb_gain = (4 * PI * xb_A) / (xb_λ ** 2);
+const xb_P = 100;
+const xb_EIRP = xb_P * xb_gain;
+const xb_rxP = (xb_EIRP / (4 * PI * d_m * d_m)) * p.rxArea_m2;
+const xb_BW = 500e6;
+const xb_N = k_B * p.rxTemp_K * xb_BW;
+const xb_SNR = xb_rxP / xb_N;
+const xb_cap = xb_BW * Math.log2(1 + Math.max(xb_SNR, 0));
+const xb_mass = 45;
+const xb_power = 150; // TWTA + electronics
+
+// Total dual-use overhead
+const dualUseMass = geom.totalHornMass + modMass;
+const dualUsePower = modPower;
+
+return {
+spotArea, captureFrac,
+P_rx, P_signal, N_thermal, N_shot, N_total,
+SNR, SNR_dB,
+capacity_bps, shannonLimit, bitsPerSymbol,
+modMass, modPower, dualUseMass, dualUsePower,
+// x-band
+xb_cap, xb_mass, xb_power, xb_SNR_dB: 10 * Math.log10(Math.max(xb_SNR, 1e-30)),
+// ratios
+massSaved: xb_mass - dualUseMass,
+powerSaved: xb_power - dualUsePower,
+bpsPerKg_dual: capacity_bps / (dualUseMass || 0.01),
+bpsPerKg_xband: xb_cap / xb_mass,
+};
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UI HELPERS
+// ═══════════════════════════════════════════════════════════════
+const fmt = (n, d = 1) => {
+if (!isFinite(n)) return “∞”;
+const abs = Math.abs(n);
+if (abs >= 1e15) return (n / 1e15).toFixed(d) + “P”;
+if (abs >= 1e12) return (n / 1e12).toFixed(d) + “T”;
+if (abs >= 1e9) return (n / 1e9).toFixed(d) + “G”;
+if (abs >= 1e6) return (n / 1e6).toFixed(d) + “M”;
+if (abs >= 1e3) return (n / 1e3).toFixed(d) + “k”;
+return n.toFixed(d);
+};
+const fmtBits = (b) => {
+if (!isFinite(b) || b <= 0) return “0 bps”;
+if (b >= 1e12) return (b / 1e12).toFixed(1) + “ Tbps”;
+if (b >= 1e9) return (b / 1e9).toFixed(1) + “ Gbps”;
+if (b >= 1e6) return (b / 1e6).toFixed(1) + “ Mbps”;
+if (b >= 1e3) return (b / 1e3).toFixed(1) + “ kbps”;
+return b.toFixed(0) + “ bps”;
+};
+const fmtCost = (n) => {
+if (!isFinite(n)) return “∞”;
+if (n >= 1e9) return “$” + (n / 1e9).toFixed(1) + “B”;
+if (n >= 1e6) return “$” + (n / 1e6).toFixed(1) + “M”;
+if (n >= 1e3) return “$” + (n / 1e3).toFixed(1) + “k”;
+return “$” + n.toFixed(0);
+};
+
+function MiniChart({ data, xKey, yKey, xLabel, yLabel, color, highlight, logY }) {
+const W = 300, H = 120, P = 30;
+const xs = data.map(d => d[xKey]);
+const rawYs = data.map(d => { const v = d[yKey]; return isFinite(v) ? v : 0; });
+const ys = logY ? rawYs.map(v => v > 0 ? Math.log10(v) : 0) : rawYs;
+const xMn = Math.min(…xs), xMx = Math.max(…xs);
+const yMn = Math.min(…ys), yMx = Math.max(…ys);
+const sx = v => P + ((v - xMn) / (xMx - xMn || 1)) * (W - P * 2);
+const sy = v => H - P - ((v - yMn) / (yMx - yMn || 1)) * (H - P * 2);
+const pathD = data.map((d, i) => {
+const y = logY ? (rawYs[i] > 0 ? Math.log10(rawYs[i]) : 0) : rawYs[i];
+return `${i === 0 ? "M" : "L"}${sx(d[xKey])},${sy(y)}`;
+}).join(” “);
+const hIdx = data.reduce((b, d, i) => Math.abs(d[xKey] - highlight) < Math.abs(data[b][xKey] - highlight) ? i : b, 0);
+const hy = logY ? (rawYs[hIdx] > 0 ? Math.log10(rawYs[hIdx]) : 0) : rawYs[hIdx];
+return (
+<svg viewBox={`0 0 ${W} ${H}`} style={{ width: “100%”, maxWidth: 340, height: “auto” }}>
+{[.25, .5, .75].map(f => <line key={f} x1={P} x2={W - P} y1={sy(yMn + f * (yMx - yMn))} y2={sy(yMn + f * (yMx - yMn))} stroke=”#1a2a3a” strokeWidth={0.5} />)}
+<path d={pathD} fill="none" stroke={color} strokeWidth={2} opacity={0.9} />
+<path d={pathD} fill="none" stroke={color} strokeWidth={5} opacity={0.12} />
+<circle cx={sx(data[hIdx][xKey])} cy={sy(hy)} r={4.5} fill={color} />
+<circle cx={sx(data[hIdx][xKey])} cy={sy(hy)} r={9} fill={color} opacity={0.15} />
+<text x={W / 2} y={H - 3} textAnchor=“middle” fill=”#5a7a8a” fontSize={8} fontFamily=“monospace”>{xLabel}</text>
+<text x={3} y={H / 2} textAnchor=“middle” fill=”#5a7a8a” fontSize={8} fontFamily=“monospace” transform={`rotate(-90,3,${H / 2})`}>{yLabel}</text>
+</svg>
+);
+}
+
+function CompBar({ l1, v1, l2, v2, c1, c2, u }) {
+const mx = Math.max(Math.abs(v1), Math.abs(v2), 1e-30);
+return (
+<div style={{ marginBottom: 8 }}>
+<div style={{ display: “flex”, justifyContent: “space-between”, fontSize: 9, color: “#4a6a7a”, marginBottom: 2 }}>
+<span>{l1}: <b style={{ color: c1 }}>{u(v1)}</b></span>
+<span>{l2}: <b style={{ color: c2 }}>{u(v2)}</b></span>
+</div>
+<div style={{ display: “flex”, gap: 2, height: 10, borderRadius: 3, background: “#0a0e14” }}>
+<div style={{ width: `${(Math.abs(v1) / mx) * 100}%`, background: `linear-gradient(90deg,${c1}40,${c1})`, borderRadius: “3px 0 0 3px”, minWidth: 2, transition: “width 0.3s” }} />
+<div style={{ width: `${(Math.abs(v2) / mx) * 100}%`, background: `linear-gradient(90deg,${c2}40,${c2})`, borderRadius: “0 3px 3px 0”, minWidth: 2, transition: “width 0.3s” }} />
+</div>
+</div>
+);
+}
+
+function Slider({ k, label, unit, min, max, step, value, onChange, accent = “#00ccaa” }) {
+return (
+<div style={{ marginBottom: 9 }}>
+<div style={{ display: “flex”, justifyContent: “space-between”, marginBottom: 1 }}>
+<span style={{ fontSize: 10, color: “#5a7a8a” }}>{label}</span>
+<span style={{ fontSize: 10, color: accent, fontWeight: 600 }}>{value}{unit ? ` ${unit}` : “”}</span>
+</div>
+<input type=“range” min={min} max={max} step={step} value={value}
+onChange={e => onChange(k, parseFloat(e.target.value))}
+style={{ width: “100%”, height: 20, accentColor: accent, cursor: “pointer” }} />
+</div>
+);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PARAMETER DEFINITIONS
+// ═══════════════════════════════════════════════════════════════
+const L1_PARAMS = [
+{ key: “computePower_kW”, label: “Compute Power”, unit: “kW”, min: 10, max: 5000, step: 10 },
+{ key: “efficiency”, label: “Efficiency”, unit: “”, min: 0.05, max: 0.95, step: 0.01 },
+{ key: “radTemp_K”, label: “Bulk Rad Temp”, unit: “K”, min: 250, max: 500, step: 5 },
+{ key: “emissivity”, label: “Emissivity ε”, unit: “”, min: 0.5, max: 0.98, step: 0.01 },
+{ key: “sinkTemp_K”, label: “Sink Temp”, unit: “K”, min: 3, max: 380, step: 1 },
+{ key: “radDensity_kgm2”, label: “Rad Density”, unit: “kg/m²”, min: 1, max: 20, step: 0.5 },
+];
+
+const L2_PARAMS = [
+{ key: “hotSegmentTemp_K”, label: “Hot Segment Temp”, unit: “K”, min: 300, max: 1200, step: 10 },
+{ key: “hotSegmentFraction”, label: “Hot Fraction”, unit: “”, min: 0.01, max: 0.3, step: 0.01 },
+{ key: “throatWidth_m”, label: “Throat Width”, unit: “m”, min: 0.001, max: 0.05, step: 0.001 },
+{ key: “hornApertureWidth_m”, label: “Horn Aperture”, unit: “m”, min: 0.05, max: 1.0, step: 0.01 },
+{ key: “hornMass_kg”, label: “Horn Mass (each)”, unit: “kg”, min: 0.1, max: 5, step: 0.1 },
+{ key: “modBW_GHz”, label: “Optical BW”, unit: “GHz”, min: 0.1, max: 100, step: 0.1 },
+];
+
+const L3_PARAMS = [
+{ key: “distance_km”, label: “Distance”, unit: “km”, min: 400, max: 400000, step: 100 },
+{ key: “rxArea_m2”, label: “Receiver Area”, unit: “m²”, min: 0.1, max: 100, step: 0.1 },
+{ key: “rxTemp_K”, label: “Receiver Temp”, unit: “K”, min: 4, max: 300, step: 1 },
+{ key: “modDepthFrac”, label: “Mod Depth”, unit: “”, min: 0.05, max: 0.95, step: 0.01 },
+{ key: “switchRate_kHz”, label: “Switch Rate”, unit: “kHz”, min: 1, max: 10000, step: 1 },
+{ key: “modMassPerThroat_kg”, label: “Mod Mass/throat”, unit: “kg”, min: 0.01, max: 0.5, step: 0.01 },
+{ key: “modPowerPerThroat_W”, label: “Mod Power/throat”, unit: “W”, min: 0.01, max: 5, step: 0.01 },
+];
+
+const DEFAULTS = {
+// L1
+computePower_kW: 500, efficiency: 0.35, radTemp_K: 350, emissivity: 0.92,
+sinkTemp_K: 3, radDensity_kgm2: 5,
+// L2
+hotSegmentTemp_K: 700, hotSegmentFraction: 0.05, throatWidth_m: 0.005,
+hornApertureWidth_m: 0.2, hornMass_kg: 0.5, modBW_GHz: 10,
+// L3
+distance_km: 36000, rxArea_m2: 10, rxTemp_K: 50,
+modDepthFrac: 0.6, switchRate_kHz: 1000,
+modMassPerThroat_kg: 0.1, modPowerPerThroat_W: 1.0,
+};
+
+const SCENARIOS = {
+“LEO Beacon”: {
+…DEFAULTS, computePower_kW: 500, radTemp_K: 350, sinkTemp_K: 3,
+hotSegmentTemp_K: 600, hotSegmentFraction: 0.05, distance_km: 400,
+switchRate_kHz: 5000, rxTemp_K: 50,
+},
+“GEO Downlink”: {
+…DEFAULTS, computePower_kW: 1000, radTemp_K: 350, sinkTemp_K: 3,
+hotSegmentTemp_K: 800, hotSegmentFraction: 0.08, distance_km: 36000,
+switchRate_kHz: 2000, rxTemp_K: 30,
+},
+“Lunar DC”: {
+…DEFAULTS, computePower_kW: 200, radTemp_K: 400, sinkTemp_K: 280,
+hotSegmentTemp_K: 900, hotSegmentFraction: 0.1, distance_km: 384400,
+rxArea_m2: 50, rxTemp_K: 20, switchRate_kHz: 500,
+},
+“L2 Deep”: {
+…DEFAULTS, computePower_kW: 2000, radTemp_K: 300, sinkTemp_K: 3,
+hotSegmentTemp_K: 1000, hotSegmentFraction: 0.03, distance_km: 1500000,
+rxArea_m2: 80, rxTemp_K: 10, switchRate_kHz: 1000,
+},
+};
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN COMPONENT
+// ═══════════════════════════════════════════════════════════════
+export default function ThermopylaeSimulator() {
+const [params, setParams] = useState(SCENARIOS[“GEO Downlink”]);
+const [tab, setTab] = useState(“overview”); // overview | layers | sweep | compare
+const [activeScenario, setActiveScenario] = useState(“GEO Downlink”);
+const [sweepKey, setSweepKey] = useState(“hotSegmentTemp_K”);
+
+const setP = useCallback((k, v) => { setParams(p => ({ …p, [k]: v })); setActiveScenario(null); }, []);
+
+const bulk = useMemo(() => computeBulkRadiator(params), [params]);
+const geom = useMemo(() => computeGeometricConcentrator(bulk, params), [bulk, params]);
+const mod = useMemo(() => computeActiveModulator(geom, params), [geom, params]);
+
+// Sweep data
+const allParamDefs = […L1_PARAMS, …L2_PARAMS, …L3_PARAMS];
+const sweepDef = allParamDefs.find(p => p.key === sweepKey) || L2_PARAMS[0];
+const sweepData = useMemo(() => {
+const out = [];
+for (let i = 0; i <= 80; i++) {
+const val = sweepDef.min + (sweepDef.max - sweepDef.min) * (i / 80);
+const sp = { …params, [sweepKey]: val };
+const b = computeBulkRadiator(sp);
+const g = computeGeometricConcentrator(b, sp);
+const m = computeActiveModulator(g, sp);
+out.push({ x: val, capacity: m.capacity_bps, SNR_dB: m.SNR_dB, radArea: b.A_total, P_rx: m.P_rx });
+}
+return out;
+}, [params, sweepKey, sweepDef]);
+
+const S = {
+box: { background: “#0d1520”, border: “1px solid #1a2a3a”, borderRadius: 4, padding: “6px 8px” },
+lbl: { fontSize: 9, color: “#3a5a6a”, textTransform: “uppercase”, letterSpacing: 0.8 },
+val: { fontSize: 14, color: “#e0f0f4”, fontWeight: 600, marginTop: 2 },
+sub: { fontSize: 9, color: “#4a6a7a”, marginTop: 1 },
+};
+
+const tabBtn = (t, label) => (
+<button onClick={() => setTab(t)} style={{
+flex: 1, padding: “7px 0”, textAlign: “center”, fontSize: 10, fontWeight: 600,
+color: tab === t ? “#00ccaa” : “#3a5a6a”, background: tab === t ? “#00ccaa08” : “transparent”,
+border: “none”, borderBottom: `2px solid ${tab === t ? "#00ccaa" : "#1a2a3a"}`,
+cursor: “pointer”, fontFamily: “inherit”,
+}}>{label}</button>
+);
+
+// Layer health indicators
+const thermalOk = bulk.q_rad > 0 && isFinite(bulk.A_total);
+const commsViable = mod.SNR > 1;
+const dualWin = mod.massSaved > 0;
+
+return (
+<div style={{
+background: “#0a0e14”, color: “#c0d0d8”, minHeight: “100vh”,
+fontFamily: “‘JetBrains Mono’,‘Fira Code’,‘SF Mono’,monospace”,
+fontSize: 13, padding: “12px 10px”, maxWidth: 420, margin: “0 auto”,
+}}>
+{/* Header */}
+<div style={{ borderBottom: “1px solid #1a2a3a”, paddingBottom: 8, marginBottom: 10 }}>
+<div style={{ fontSize: 14, color: “#00ccaa”, fontWeight: 700, letterSpacing: 1.5 }}>
+THERMOPYLAE
+</div>
+<div style={{ fontSize: 9, color: “#3a5a6a”, marginTop: 2 }}>
+Three-layer dual-use: bulk radiator → horn concentrator → active modulator
+</div>
+</div>
+
+```
+  {/* Scenarios */}
+  <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 10 }}>
+    {Object.keys(SCENARIOS).map(name => (
+      <button key={name} onClick={() => { setParams(SCENARIOS[name]); setActiveScenario(name); }}
+        style={{
+          background: activeScenario === name ? "#00ccaa12" : "#0d1520",
+          border: `1px solid ${activeScenario === name ? "#00ccaa" : "#1a2a3a"}`,
+          color: activeScenario === name ? "#00ccaa" : "#5a7a8a",
+          borderRadius: 4, padding: "4px 7px", fontSize: 9, cursor: "pointer", fontFamily: "inherit",
+        }}>{name}</button>
+    ))}
+  </div>
+
+  {/* System health bar */}
+  <div style={{ display: "flex", gap: 4, marginBottom: 12 }}>
+    {[
+      { label: "L1 THERMAL", ok: thermalOk, v: fmt(bulk.A_total, 0) + "m²" },
+      { label: "L2 BEAM", ok: geom.N_horns > 0, v: geom.N_horns + " horns" },
+      { label: "L3 LINK", ok: commsViable, v: mod.SNR_dB.toFixed(0) + "dB" },
+    ].map(({ label, ok, v }) => (
+      <div key={label} style={{
+        flex: 1, background: "#0d1520", border: `1px solid ${ok ? "#00ccaa30" : "#ff444430"}`,
+        borderRadius: 4, padding: "4px 6px", textAlign: "center",
+      }}>
+        <div style={{ fontSize: 7, color: ok ? "#00ccaa" : "#ff4444", letterSpacing: 0.5 }}>{label}</div>
+        <div style={{ fontSize: 11, color: ok ? "#e0f0f4" : "#ff6644", fontWeight: 600 }}>{v}</div>
+      </div>
+    ))}
+  </div>
+
+  {/* Tabs */}
+  <div style={{ display: "flex", marginBottom: 10 }}>
+    {tabBtn("overview", "OVERVIEW")}
+    {tabBtn("layers", "LAYERS")}
+    {tabBtn("sweep", "SWEEP")}
+    {tabBtn("compare", "vs X-BAND")}
+  </div>
+
+  {/* ─── OVERVIEW ─── */}
+  {tab === "overview" && <>
+    {/* Energy flow diagram */}
+    <div style={{ ...S.box, marginBottom: 10 }}>
+      <div style={{ ...S.lbl, marginBottom: 8, color: "#00ccaa" }}>ENERGY FLOW</div>
+      {[
+        { l: "Input Power", v: fmt(params.computePower_kW * 1000) + "W", c: "#ffffff", w: 100 },
+        { l: "→ Useful Compute", v: fmt(params.computePower_kW * 1000 * params.efficiency) + "W", c: "#4488ff", w: params.efficiency * 100 },
+        { l: "→ Waste Heat", v: fmt(bulk.P_waste) + "W", c: "#ff6644", w: (1 - params.efficiency) * 100 },
+        { l: "  → Bulk Radiation", v: fmt(bulk.P_waste * (1 - params.hotSegmentFraction)) + "W", c: "#ff664488", w: (1 - params.efficiency) * (1 - params.hotSegmentFraction) * 100 },
+        { l: "  → Hot Segment", v: fmt(geom.P_hot_total) + "W", c: "#ffaa44", w: Math.min(30, (geom.P_hot_total / (params.computePower_kW * 1000)) * 100) },
+        { l: "    → Directed Beam", v: fmt(geom.P_directed_total) + "W", c: "#00ccaa", w: Math.min(15, (geom.P_directed_total / (params.computePower_kW * 1000)) * 100) },
+        { l: "      → Received", v: fmt(mod.P_rx) + "W", c: "#00ffaa", w: Math.max(1, Math.min(10, (mod.P_rx / (params.computePower_kW * 1000)) * 1e6)) },
+      ].map(({ l, v, c, w }) => (
+        <div key={l} style={{ marginBottom: 4 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#5a7a8a" }}>
+            <span>{l}</span><span style={{ color: c, fontWeight: 600 }}>{v}</span>
+          </div>
+          <div style={{ height: 4, background: "#0a0e14", borderRadius: 2, overflow: "hidden" }}>
+            <div style={{ width: `${Math.max(1, w)}%`, height: "100%", background: c, borderRadius: 2, transition: "width 0.3s" }} />
+          </div>
+        </div>
+      ))}
+    </div>
+
+    {/* Key metrics */}
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 10 }}>
+      <div style={S.box}>
+        <div style={S.lbl}>Channel Capacity</div>
+        <div style={{ ...S.val, color: "#00ffaa" }}>{fmtBits(mod.capacity_bps)}</div>
+        <div style={S.sub}>@ {params.switchRate_kHz} kHz switch</div>
+      </div>
+      <div style={S.box}>
+        <div style={S.lbl}>Shannon Limit</div>
+        <div style={{ ...S.val, color: "#4488ff" }}>{fmtBits(mod.shannonLimit)}</div>
+        <div style={S.sub}>if full BW usable</div>
+      </div>
+      <div style={S.box}>
+        <div style={S.lbl}>Dual-Use Mass</div>
+        <div style={S.val}>{mod.dualUseMass.toFixed(1)} kg</div>
+        <div style={S.sub}>horns + modulators</div>
+      </div>
+      <div style={S.box}>
+        <div style={S.lbl}>Mod Power</div>
+        <div style={S.val}>{mod.dualUsePower.toFixed(1)} W</div>
+        <div style={S.sub}>{geom.N_horns} × {params.modPowerPerThroat_W}W</div>
+      </div>
+    </div>
+
+    {/* Architecture note */}
+    <div style={{
+      background: "#00ccaa06", border: "1px solid #00ccaa20",
+      borderRadius: 4, padding: "8px 10px", fontSize: 9, color: "#5a8a7a", lineHeight: 1.6,
+    }}>
+      <b style={{ color: "#00ccaa" }}>THERMOPYLAE ARCHITECTURE: </b>
+      Bulk radiator does its thermal job unchanged. A small hot fraction ({(params.hotSegmentFraction * 100).toFixed(0)}%)
+      runs at {params.hotSegmentTemp_K}K pushing emission to {geom.λ_emit_um.toFixed(1)}μm.
+      Horn structures narrow the lobe to {geom.beamDiv_arcsec.toFixed(1)}″ — geometry does the
+      beam-forming, not coherence. Active modulators at each throat gate the emission
+      at {params.switchRate_kHz} kHz. Brightness capped at T_phys. Information rides the modulation,
+      carrier power is free.
+    </div>
+  </>}
+
+  {/* ─── LAYERS ─── */}
+  {tab === "layers" && <>
+    <div style={{ ...S.lbl, color: "#ff6644", marginBottom: 6 }}>LAYER 1: BULK RADIATOR</div>
+    {L1_PARAMS.map(p => <Slider key={p.key} {...p} value={params[p.key]} onChange={setP} accent="#ff6644" />)}
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 14 }}>
+      <div style={S.box}><div style={{ fontSize: 8, color: "#3a5a6a" }}>Area</div><div style={{ fontSize: 12, color: "#ff6644", fontWeight: 600 }}>{fmt(bulk.A_total, 0)}m²</div></div>
+      <div style={S.box}><div style={{ fontSize: 8, color: "#3a5a6a" }}>Mass</div><div style={{ fontSize: 12, color: "#ff6644", fontWeight: 600 }}>{fmt(bulk.mass_rad, 0)}kg</div></div>
+      <div style={S.box}><div style={{ fontSize: 8, color: "#3a5a6a" }}>W/m²</div><div style={{ fontSize: 12, color: "#ff6644", fontWeight: 600 }}>{fmt(bulk.q_rad, 0)}</div></div>
+    </div>
+
+    <div style={{ ...S.lbl, color: "#ffaa44", marginBottom: 6 }}>LAYER 2: HORN CONCENTRATOR</div>
+    {L2_PARAMS.map(p => <Slider key={p.key} {...p} value={params[p.key]} onChange={setP} accent="#ffaa44" />)}
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 14 }}>
+      <div style={S.box}><div style={{ fontSize: 8, color: "#3a5a6a" }}>Horns</div><div style={{ fontSize: 12, color: "#ffaa44", fontWeight: 600 }}>{geom.N_horns}</div></div>
+      <div style={S.box}><div style={{ fontSize: 8, color: "#3a5a6a" }}>Beam</div><div style={{ fontSize: 12, color: "#ffaa44", fontWeight: 600 }}>{geom.beamDiv_arcsec.toFixed(1)}″</div></div>
+      <div style={S.box}><div style={{ fontSize: 8, color: "#3a5a6a" }}>λ emit</div><div style={{ fontSize: 12, color: "#ffaa44", fontWeight: 600 }}>{geom.λ_emit_um.toFixed(1)}μm</div></div>
+    </div>
+
+    <div style={{ ...S.lbl, color: "#00ccaa", marginBottom: 6 }}>LAYER 3: ACTIVE MODULATOR</div>
+    {L3_PARAMS.map(p => <Slider key={p.key} {...p} value={params[p.key]} onChange={setP} accent="#00ccaa" />)}
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 14 }}>
+      <div style={S.box}><div style={{ fontSize: 8, color: "#3a5a6a" }}>SNR</div><div style={{ fontSize: 12, color: "#00ccaa", fontWeight: 600 }}>{mod.SNR_dB.toFixed(1)}dB</div></div>
+      <div style={S.box}><div style={{ fontSize: 8, color: "#3a5a6a" }}>Capacity</div><div style={{ fontSize: 12, color: "#00ccaa", fontWeight: 600 }}>{fmtBits(mod.capacity_bps)}</div></div>
+      <div style={S.box}><div style={{ fontSize: 8, color: "#3a5a6a" }}>Rx Power</div><div style={{ fontSize: 12, color: "#00ccaa", fontWeight: 600 }}>{fmt(mod.P_rx)}W</div></div>
+    </div>
+  </>}
+
+  {/* ─── SWEEP ─── */}
+  {tab === "sweep" && <>
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+      <span style={S.lbl}>SWEEP PARAM:</span>
+      <select value={sweepKey} onChange={e => setSweepKey(e.target.value)}
+        style={{ background: "#0d1520", border: "1px solid #1a2a3a", color: "#00ccaa", borderRadius: 4, padding: "3px 6px", fontSize: 9, fontFamily: "inherit" }}>
+        {allParamDefs.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+      </select>
+    </div>
+    <MiniChart data={sweepData} xKey="x" yKey="capacity" xLabel={sweepDef.label} yLabel="Capacity bps" color="#00ccaa" highlight={params[sweepKey]} logY />
+    <MiniChart data={sweepData} xKey="x" yKey="SNR_dB" xLabel={sweepDef.label} yLabel="SNR dB" color="#ffaa44" highlight={params[sweepKey]} />
+    <MiniChart data={sweepData} xKey="x" yKey="P_rx" xLabel={sweepDef.label} yLabel="Rx Power W" color="#4488ff" highlight={params[sweepKey]} logY />
+
+    <div style={{ marginTop: 10 }}>
+      <Slider {...sweepDef} value={params[sweepKey]} onChange={setP} />
+    </div>
+  </>}
+
+  {/* ─── COMPARE ─── */}
+  {tab === "compare" && <>
+    <div style={{ ...S.box, marginBottom: 10, borderColor: "#00ccaa30" }}>
+      <div style={{ ...S.lbl, color: "#00ccaa", marginBottom: 8 }}>THERMOPYLAE vs 3m X-BAND DISH</div>
+      <CompBar l1="IR Dual-Use" v1={mod.capacity_bps} l2="X-Band" v2={mod.xb_cap} c1="#00ccaa" c2="#ff6644" u={fmtBits} />
+      <CompBar l1="IR SNR" v1={mod.SNR_dB} l2="X-Band SNR" v2={mod.xb_SNR_dB} c1="#00ccaa" c2="#ff6644" u={v => v.toFixed(1) + "dB"} />
+      <CompBar l1="Overhead" v1={mod.dualUseMass} l2="Dedicated" v2={mod.xb_mass} c1="#00ccaa" c2="#ff6644" u={v => v.toFixed(0) + "kg"} />
+      <CompBar l1="Power" v1={mod.dualUsePower} l2="TWTA" v2={mod.xb_power} c1="#00ccaa" c2="#ff6644" u={v => v.toFixed(0) + "W"} />
+    </div>
+
+    <div style={{ ...S.box, marginBottom: 10 }}>
+      <div style={{ ...S.lbl, marginBottom: 6 }}>MASS EFFICIENCY (bps/kg)</div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <div>
+          <div style={{ fontSize: 8, color: "#4a6a7a" }}>Thermopylae</div>
+          <div style={{ fontSize: 15, color: "#00ccaa", fontWeight: 700 }}>{fmtBits(mod.bpsPerKg_dual)}/kg</div>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 8, color: "#4a6a7a" }}>X-Band</div>
+          <div style={{ fontSize: 15, color: "#ff6644", fontWeight: 700 }}>{fmtBits(mod.bpsPerKg_xband)}/kg</div>
+        </div>
+      </div>
+      <div style={{
+        marginTop: 8, fontSize: 11, textAlign: "center", fontWeight: 700,
+        color: dualWin ? "#00ffaa" : "#ff6644",
+      }}>
+        {dualWin
+          ? `THERMOPYLAE: saves ${mod.massSaved.toFixed(0)}kg = ${fmtCost(mod.massSaved * (params.radDensity_kgm2 > 0 ? 2700 : 2700))} launch`
+          : `X-BAND WINS by ${(-mod.massSaved).toFixed(0)}kg`}
+      </div>
+    </div>
+
+    <div style={{ ...S.box, marginBottom: 10, fontSize: 9, color: "#5a8a7a", lineHeight: 1.6 }}>
+      <b style={{ color: "#00ccaa" }}>REGIME MAP: </b>
+      Thermopylae wins when you already have large radiator area (high compute waste heat),
+      moderate distances (LEO/GEO), and can tolerate modest data rates.
+      X-band wins for deep space, high data rate, or when radiator area is small.
+      <br /><br />
+      <b style={{ color: "#ffaa44" }}>HYBRID OPTION: </b>
+      Use Thermopylae as a secondary/backup link, beacon, or telemetry channel.
+      Reserve X-band for bulk data. The IR link costs almost nothing if the radiator exists —
+      it's a free bonus channel on sunk mass.
+    </div>
+
+    <div style={{
+      background: "#ff664408", border: "1px solid #ff664420",
+      borderRadius: 4, padding: "8px 10px", fontSize: 9, color: "#7a5a4a", lineHeight: 1.6,
+    }}>
+      <b style={{ color: "#ff6644" }}>OPEN QUESTIONS: </b>
+      Atmospheric windows at receiver wavelength. Thermal stability during modulation —
+      does switching emissivity at kHz rates create thermal cycling fatigue?
+      Horn alignment tolerance over structural flexing. Whether hot segment
+      creates thermal gradient problems for adjacent compute hardware.
+    </div>
+  </>}
+
+  <div style={{ fontSize: 7, color: "#1a2a3a", textAlign: "center", padding: 10 }}>
+    Planck · Stefan-Boltzmann · Shannon-Hartley · Wien
+  </div>
+</div>
+```
+
+);
+}
