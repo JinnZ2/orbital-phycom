@@ -27,3 +27,14 @@ def track_salvage_target(l1, l2):
         return None
 
 # track_salvage_target(tle_line1, tle_line2)
+
+
+
+def calculate_miss_distance(pos_forge, pos_junk):
+    """Calculate the distance between the Salvage Ship and the Debris."""
+    distance = np.linalg.norm(np.array(pos_junk) - np.array(pos_forge))
+    
+    # If distance < 2km, trigger "Handshake" mechanism
+    if distance < 2.0:
+        print("FELTSensor: High Efficiency. Intercept feasible.")
+    return distance
