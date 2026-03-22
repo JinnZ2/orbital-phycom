@@ -7,7 +7,6 @@ to create coordinated atmospheric signatures without artificial intervention.
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.integrate import solve_ivp
 from scipy.ndimage import gaussian_filter
 from .thermal_dynamics import AtmosphericSimulator
 
@@ -191,10 +190,7 @@ class GroundAtmosphericCoupler:
             domain_km: Domain size in kilometers
             grid_size: Grid resolution
         """
-        self.sim = AtmosphericSimulator(grid_size=gri​​​​​​​​​​​​​​​​
-
-
-d_size, domain_km=domain_km, dt=60.0)
+        self.sim = AtmosphericSimulator(grid_size=grid_size, domain_km=domain_km, dt=60.0)
         self.controller = GroundThermalController(self.sim)
         
         # Measurement stations for atmospheric detection

@@ -1,3 +1,4 @@
+"""
 Hydrodynamic Joint Simulator
 
 Physics-based simulation of geometric surface patterns creating
@@ -84,14 +85,14 @@ class GeometricSeedController:
                 break
             
             A = seed[idx] * self.h0       # Amplitude: 0-1 → 0-h0
-            λ = seed[idx + 1] * self.Lx   # Wavelength: 0-1 → 0-Lx  
-            φ = seed[idx + 2] * 2 * np.pi # Phase: 0-1 → 0-2π
+            wavelength = seed[idx + 1] * self.Lx   # Wavelength: 0-1 -> 0-Lx
+            phase = seed[idx + 2] * 2 * np.pi  # Phase: 0-1 -> 0-2pi
             
             # Wave number
-            k = 2 * np.pi / (λ + 1e-10)
+            k = 2 * np.pi / (wavelength + 1e-10)
             
             # Add sinusoidal component
-            h += A * np.sin(k * self.X + φ)
+            h += A * np.sin(k * self.X + phase)
         
         return h
     
@@ -148,13 +149,13 @@ class GeometricSeedController:
         X_rel = self.X - x_center
         Y_rel = self.Y - y_center
         r = np.sqrt(X_rel**2 + Y_rel**2)
-        θ = np.arctan2(Y_rel, X_rel)
+        theta = np.arctan2(Y_rel, X_rel)
         
         # Spiral function
         max_r = min(self.Lx, self.Ly) / 2
         spiral = np.where(
             r < max_r,
-            A * np.sin(2 * np.pi * n_turns * r / max_r + θ) * (1 - r / max_r),
+            A * np.sin(2 * np.pi * n_turns * r / max_r + theta) * (1 - r / max_r),
             0
         )
         
@@ -482,4 +483,3 @@ def quick_demonstration():
 
 if __name__ == '__main__':
     quick_demonstration()
-ENDOFFILE

@@ -67,7 +67,7 @@ class ThreeSatelliteExpander:
         
         Seed structure: 5 values per satellite × 3 satellites = 15 values
         Each 5-value block: [prograde, retrograde, outward, inward, north]
-        6th value (south) implicit from energy conservation (sum = 1.0)
+        6th value (south) implicit from normalization constraint (sum = 1.0)
         
         Args:
             seed: List/array of 15 values (0.0-1.0 each)
@@ -90,7 +90,7 @@ class ThreeSatelliteExpander:
         for sat_idx in range(3):
             sat_seed = seed_matrix[sat_idx]
             
-            # Add 6th implicit component (energy conservation)
+            # Add 6th implicit component (normalization: sum = 1.0)
             s = np.array(list(sat_seed) + [1.0 - sum(sat_seed)])
             s = s / s.sum()  # Ensure normalization
             
@@ -121,23 +121,23 @@ class ThreeSatelliteExpander:
         r_vec = np.array([x, y, z])
         
         # Compute VNB basis vectors
-        # V: velocity direction
+        # V: velocity direction (prograde)
         V_hat = v_vec / np.linalg.norm(v_vec)
-        
-        # N: radial direction (outward from Earth)
+
+        # N: radial direction (outward from Earth center)
         r_hat = r_vec / np.linalg.norm(r_vec)
-        
-        # B: orbit normal (cross product)
-        N_hat = np.cross(r_hat, V_hat)
-        if np.linalg.norm(N_hat) > 0:
-            N_hat = N_hat / np.linalg.norm(N_hat)
+
+        # B: binormal (orbit normal, completes right-hand triad)
+        B_hat = np.cross(r_hat, V_hat)
+        if np.linalg.norm(B_hat) > 0:
+            B_hat = B_hat / np.linalg.norm(B_hat)
         else:
-            N_hat = np.array([0, 0, 1])  # Default to z-axis
-        
-        # Transform ΔV from VNB to inertial frame
-        deltaV_inertial = (deltaV_vector[0] * V_hat + 
-                          deltaV_vector[1] * r_hat +  # radial = normal in orbital sense
-                          deltaV_vector[2] * N_hat)
+            B_hat = np.array([0, 0, 1])  # Default to z-axis for singular case
+
+        # Transform deltaV from VNB to inertial frame
+        deltaV_inertial = (deltaV_vector[0] * V_hat +
+                          deltaV_vector[1] * r_hat +   # radial (normal)
+                          deltaV_vector[2] * B_hat)     # binormal
         
         # Apply to velocity
         new_state = state.copy()
@@ -331,13 +331,3 @@ def quick_test():
 
 if __name__ == '__main__':
     quick_test()
-
-
-
-### potential extensions:  # Add SRP + J2 (in dynamics()):
-r_norm = np.linalg.norm(r)
-SRP_acc = -P_SRP * A/m * (r_unit - sun_dir)  # Solar radiation pressure
-J2_acc = J2_term(r, lat, alt)                 # Oblateness
-
-# Noise injection for sensitivity tests
-phase_rates += np.random.normal(0, solar_storm_noise, phase_rates.shape)

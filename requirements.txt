@@ -1,0 +1,5 @@
+numpy>=1.21
+scipy>=1.7
+matplotlib>=3.5
+sgp4>=2.20
+requests>=2.25

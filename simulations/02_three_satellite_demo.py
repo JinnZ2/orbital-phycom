@@ -16,6 +16,7 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+from scipy.interpolate import interp1d
 from core.seed_expander import ThreeSatelliteExpander
 
 
@@ -128,7 +129,7 @@ def main():
         ax = plt.subplot(4, 3, i+4)
         
         # Interpolate baseline to match times
-        from scipy.interpolate import interp1d
+
         if len(times) == len(times_base) and np.allclose(times, times_base):
             deviation = phase_rates[:, i] - phase_rates_base[:, i]
         else:
@@ -153,7 +154,7 @@ def main():
     ax = plt.subplot(4, 3, 7)
     for i in range(3):
         # FFT of phase rate deviation
-        from scipy.interpolate import interp1d
+
         if len(times) == len(times_base) and np.allclose(times, times_base):
             deviation = phase_rates[:, i] - phase_rates_base[:, i]
         else:
@@ -293,7 +294,7 @@ def main():
         if len(times) == len(times_base) and np.allclose(times, times_base):
             deviation = phase_rates[:, i] - phase_rates_base[:, i]
         else:
-            from scipy.interpolate import interp1d
+    
             f = interp1d(times_base, phase_rates_base[:, i], 
                         bounds_error=False, fill_value=0)
             deviation = phase_rates[:, i] - f(times)

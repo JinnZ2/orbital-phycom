@@ -1,5 +1,5 @@
 from sgp4.api import Satrec, jday
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 import numpy as np
 
 # A real piece of "Industrial Waste": COSMOS 1408 DEBRIS (Example TLE)
@@ -11,7 +11,7 @@ def track_salvage_target(l1, l2):
     satellite = Satrec.twoline2rv(l1, l2)
     
     # Get current "Tin Can" time in Julian Days
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     jd, fr = jday(now.year, now.month, now.day, now.hour, now.minute, now.second)
     
     # Propagate: Get position (km) and velocity (km/s)
