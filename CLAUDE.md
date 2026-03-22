@@ -120,6 +120,7 @@ All names follow PEP 8:
 3. **Phase rate computation**: Assumes RF inter-satellite links; real systems use angle-only tracking
 4. **Integration sampling**: 10 Hz may be overkill; 1 Hz sufficient for smooth orbital evolution
 5. **Seed recovery convergence**: Coarse search with 100-500 candidates provides approximate recovery; higher fidelity requires more candidates or longer observation windows
+6. **Signal clarification vs raw recovery** (2026-03-22): Benchmarked baseline subtraction, Savitzky-Golay denoising, and spectral filtering against raw phase-rate recovery. At current SNR (~0.22/sample, 93 samples), baseline subtraction is comparable on RMSE (0.221 vs 0.212) but reduces worst-case max error (0.415 vs 0.543). Denoising methods (SavGol, spectral) consistently hurt. **Follow-up needed**: the real path to better recovery is likely stronger ΔV, longer observation windows, or a discrete seed codebook — not post-hoc signal processing. Investigate codebook-based recovery as a next step.
 
 ## Testing
 
