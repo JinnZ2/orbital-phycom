@@ -7,7 +7,10 @@ with impulse events applied at exact times.
 
 import numpy as np
 from scipy.integrate import solve_ivp
-from .physics_constants import MU_EARTH, R_EARTH, ALTITUDE_REF, LAMBDA_RF
+from .physics_constants import (
+    MU_EARTH, R_EARTH, ALTITUDE_REF, LAMBDA_RF,
+    J2_EARTH, R_EARTH_EQUATORIAL
+)
 
 
 class OrbitalSimulator:
@@ -18,18 +21,21 @@ class OrbitalSimulator:
     avoiding timestep-dependent errors.
     """
     
-    def __init__(self, harmonic_A=2, harmonic_B=3, altitude_ref=ALTITUDE_REF):
+    def __init__(self, harmonic_A=2, harmonic_B=3, altitude_ref=ALTITUDE_REF,
+                 include_j2=True):
         """
         Initialize simulator with two satellites in harmonic orbits.
-        
+
         Args:
             harmonic_A: Harmonic multiple for satellite A (e.g., 2)
             harmonic_B: Harmonic multiple for satellite B (e.g., 3)
             altitude_ref: Reference altitude in meters
+            include_j2: Enable J2 oblateness perturbation
         """
         self.mu = MU_EARTH
         self.R_earth = R_EARTH
         self.lambda_m = LAMBDA_RF
+        self.include_j2 = include_j2
         
         # Calculate orbital parameters
         a0 = R_EARTH + altitude_ref
@@ -57,29 +63,61 @@ class OrbitalSimulator:
             0, self.vB0, 0  # Satellite B velocity
         ], dtype=float)
     
+    def _j2_acceleration(self, r_vec):
+        """
+        J2 oblateness perturbation acceleration.
+
+        Args:
+            r_vec: Position vector in ECI frame (meters)
+
+        Returns:
+            J2 acceleration vector in m/s^2
+        """
+        r = np.linalg.norm(r_vec)
+        z = r_vec[2]
+        re = R_EARTH_EQUATORIAL
+        factor = 1.5 * J2_EARTH * self.mu * re**2 / r**5
+
+        zr2 = (z / r) ** 2
+        ax = factor * r_vec[0] * (5 * zr2 - 1)
+        ay = factor * r_vec[1] * (5 * zr2 - 1)
+        az = factor * r_vec[2] * (5 * zr2 - 3)
+
+        return np.array([ax, ay, az])
+
+    def _gravity(self, r_vec):
+        """
+        Compute gravitational acceleration including optional J2.
+
+        Args:
+            r_vec: Position vector in ECI frame (meters)
+
+        Returns:
+            Acceleration vector in m/s^2
+        """
+        r_norm = np.linalg.norm(r_vec)
+        acc = -self.mu * r_vec / r_norm**3
+        if self.include_j2:
+            acc += self._j2_acceleration(r_vec)
+        return acc
+
     def dynamics(self, t, state):
         """
-        Orbital dynamics (two-body problem).
-        
+        Orbital dynamics with optional J2 perturbation.
+
         Args:
             t: Time (unused in autonomous system)
             state: [xA, yA, zA, vxA, vyA, vzA, xB, yB, zB, vxB, vyB, vzB]
-            
+
         Returns:
             Time derivatives of state
         """
-        # Extract positions
         rA = state[0:3]
         rB = state[6:9]
-        
-        # Compute accelerations (gravity only)
-        rA_norm = np.linalg.norm(rA)
-        rB_norm = np.linalg.norm(rB)
-        
-        accA = -self.mu * rA / rA_norm**3
-        accB = -self.mu * rB / rB_norm**3
-        
-        # Return [velocities, accelerations]
+
+        accA = self._gravity(rA)
+        accB = self._gravity(rB)
+
         return np.concatenate([
             state[3:6],   # vA
             accA,
@@ -262,51 +300,3 @@ def quick_test():
 
 if __name__ == '__main__':
     quick_test()
-
-
-fix:
-
-def dynamics(self, t, state):
-    """
-    Orbital dynamics with J2 Perturbation (Oblate Spheroid Earth).
-    """
-    # Constants for Earth's bulge (Sovereign Reality)
-    J2 = 1.08262668e-3 
-    
-    # Extract positions for A and B
-    rA_vec = state[0:3]
-    rB_vec = state[6:9]
-    
-    rA = np.linalg.norm(rA_vec)
-    rB = np.linalg.norm(rB_vec)
-    
-    # Pre-calculate common factors to reduce "Entropy" (CPU cycles)
-    z_sq_A = rA_vec[2]**2
-    z_sq_B = rB_vec[2]**2
-    
-    # J2 acceleration components for Sat A
-    factorA = (3/2) * J2 * self.mu * (self.R_earth**2) / (rA**5)
-    accA_j2 = np.array([
-        rA_vec[0] * (5 * z_sq_A / rA**2 - 1),
-        rA_vec[1] * (5 * z_sq_A / rA**2 - 1),
-        rA_vec[2] * (5 * z_sq_A / rA**2 - 3)
-    ]) * factorA
-    
-    # J2 acceleration components for Sat B
-    factorB = (3/2) * J2 * self.mu * (self.R_earth**2) / (rB**5)
-    accB_j2 = np.array([
-        rB_vec[0] * (5 * z_sq_B / rB**2 - 1),
-        rB_vec[1] * (5 * z_sq_B / rB**2 - 1),
-        rB_vec[2] * (5 * z_sq_B / rB**2 - 3)
-    ]) * factorB
-
-    # Total Accelerations: Pure Gravity + Shape-Induced correction
-    total_accA = (-self.mu * rA_vec / rA**3) + accA_j2
-    total_accB = (-self.mu * rB_vec / rB**3) + accB_j2
-    
-    return np.concatenate([
-        state[3:6],  # vA
-        total_accA,
-        state[9:12], # vB
-        total_accB
-    ])

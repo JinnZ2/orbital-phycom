@@ -1,3 +1,4 @@
+"""
 Synovial Joint Visualization Demo
 
 Comprehensive visualization of geometric hydrodynamic lubrication showing:
@@ -16,7 +17,7 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from biojoints.hydrodynamic_joint import GeometricSeedController, HydrodynamicJointSimulator
+from robotics.synovial_joint import GeometricSeedController, HydrodynamicJointSimulator
 
 
 def visualize_single_joint(sim, seed, pattern_type, title=""):

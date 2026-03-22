@@ -22,6 +22,10 @@ LAMBDA_RF = 0.1  # meters (3 GHz)
 # Speed of light
 C = 299792458.0  # m/s
 
+# Earth oblateness (J2 zonal harmonic)
+J2_EARTH = 1.08263e-3  # dimensionless
+R_EARTH_EQUATORIAL = 6378.137e3  # meters (WGS84 equatorial radius)
+
 # Solar radiation pressure (at 1 AU)
 P_SOLAR = 4.56e-6  # N/m^2
 
