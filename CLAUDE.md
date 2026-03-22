@@ -18,9 +18,12 @@ Orbital PHYCOM (Physics-Based Communications via Orbital Deviation) is an ultra-
 
 ```
 core/                       # Orbital mechanics & seed expansion engines
-  orbital_dynamics.py         # Two-body orbital propagation with segmented impulses
-  seed_expander.py            # 3-satellite constellation seed expansion (VNB frame)
-  physics_constants.py        # Fundamental constants (SI units)
+  orbital_dynamics.py         # Orbital propagation with J2 perturbation + segmented impulses
+  seed_expander.py            # 3-satellite constellation seed expansion (VNB frame, J2-aware)
+  noise_model.py              # Phase-rate noise sources + link budget analysis
+  seed_recovery.py            # Inverse problem: noisy observations → seed reconstruction
+  detection.py                # Signal detectability analysis (ROC, matched filter, Pd vs ΔV)
+  physics_constants.py        # Fundamental constants (SI units, includes J2)
   celestrak.py                # TLE harvesting from CelesTrak catalog
   debris_tracker.py           # Orbital debris tracking via SGP4
   drag_force.py               # Exponential atmosphere + drag acceleration
@@ -38,6 +41,7 @@ robotics/                   # Hydrodynamic joint mechanics
 simulations/                # Executable demonstrations
   01_basic_orbital_sim.py     # 2-satellite system (~30 sec)
   02_three_satellite_demo.py  # 3-satellite harmonic network (~2 min)
+  03_full_pipeline_demo.py    # Full encode→noise→detect→recover pipeline (~3-5 min)
   04_ground_atmospheric_coupling.py
 
 Thermopylae/                # Orbital thermal ecosystem architecture (JSON specs)
@@ -53,12 +57,18 @@ python simulations/01_basic_orbital_sim.py
 # Full 3-satellite demo (~2 min)
 python simulations/02_three_satellite_demo.py
 
+# Full pipeline: encode → noise → detect → recover (~3-5 min)
+python simulations/03_full_pipeline_demo.py
+
 # Ground-atmospheric coupling
 python simulations/04_ground_atmospheric_coupling.py
 
 # Individual module verification
 python core/orbital_dynamics.py
 python core/seed_expander.py
+python core/noise_model.py
+python core/detection.py
+python core/seed_recovery.py
 ```
 
 ## Code Conventions
@@ -105,10 +115,11 @@ All names follow PEP 8:
 
 ## Known Issues (from core/Fixes.md)
 
-1. **VNB singularity**: Equatorial circular orbits cause cross-product failures; falls back to z-axis
-2. **Two-body only**: Active dynamics method is Keplerian; J2/SRP/drag modules exist but are not integrated into the main propagator
+1. ~~**VNB singularity**~~: Fixed — now uses angular momentum vector for orbit-normal basis
+2. ~~**Two-body only**~~: Fixed — J2 oblateness integrated into both propagators (`include_j2=True` by default)
 3. **Phase rate computation**: Assumes RF inter-satellite links; real systems use angle-only tracking
 4. **Integration sampling**: 10 Hz may be overkill; 1 Hz sufficient for smooth orbital evolution
+5. **Seed recovery convergence**: Coarse search with 100-500 candidates provides approximate recovery; higher fidelity requires more candidates or longer observation windows
 
 ## Testing
 

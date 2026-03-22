@@ -7,7 +7,10 @@ Based on fractal intelligence framework.
 
 import numpy as np
 from scipy.integrate import solve_ivp
-from .physics_constants import MU_EARTH, R_EARTH, ALTITUDE_REF, LAMBDA_RF
+from .physics_constants import (
+    MU_EARTH, R_EARTH, ALTITUDE_REF, LAMBDA_RF,
+    J2_EARTH, R_EARTH_EQUATORIAL
+)
 
 
 class ThreeSatelliteExpander:
@@ -18,17 +21,20 @@ class ThreeSatelliteExpander:
     Compression ratio: ~7000× for daily schedules.
     """
     
-    def __init__(self, harmonics=(2, 3, 5), altitude_ref=ALTITUDE_REF):
+    def __init__(self, harmonics=(2, 3, 5), altitude_ref=ALTITUDE_REF,
+                 include_j2=True):
         """
         Initialize three-satellite system.
-        
+
         Args:
             harmonics: Tuple of prime harmonic numbers (e.g., (2, 3, 5))
             altitude_ref: Reference altitude in meters
+            include_j2: Enable J2 oblateness perturbation
         """
         self.mu = MU_EARTH
         self.R_earth = R_EARTH
         self.lambda_m = LAMBDA_RF
+        self.include_j2 = include_j2
         
         # Prime harmonics for constellation
         self.harmonics = harmonics
@@ -119,24 +125,25 @@ class ThreeSatelliteExpander:
         x, y, z, vx, vy, vz = state
         v_vec = np.array([vx, vy, vz])
         r_vec = np.array([x, y, z])
-        
-        # Compute VNB basis vectors
+
+        # Compute VNB basis via angular momentum (singularity-free)
         # V: velocity direction (prograde)
         V_hat = v_vec / np.linalg.norm(v_vec)
 
-        # N: radial direction (outward from Earth center)
-        r_hat = r_vec / np.linalg.norm(r_vec)
-
-        # B: binormal (orbit normal, completes right-hand triad)
-        B_hat = np.cross(r_hat, V_hat)
-        if np.linalg.norm(B_hat) > 0:
-            B_hat = B_hat / np.linalg.norm(B_hat)
+        # B: orbit normal from angular momentum h = r x v
+        h_vec = np.cross(r_vec, v_vec)
+        h_norm = np.linalg.norm(h_vec)
+        if h_norm > 1e-10:
+            B_hat = h_vec / h_norm
         else:
-            B_hat = np.array([0, 0, 1])  # Default to z-axis for singular case
+            B_hat = np.array([0, 0, 1])
+
+        # N: completes right-hand triad (radial-like, in orbit plane)
+        N_hat = np.cross(V_hat, B_hat)
 
         # Transform deltaV from VNB to inertial frame
         deltaV_inertial = (deltaV_vector[0] * V_hat +
-                          deltaV_vector[1] * r_hat +   # radial (normal)
+                          deltaV_vector[1] * N_hat +   # radial (normal)
                           deltaV_vector[2] * B_hat)     # binormal
         
         # Apply to velocity
@@ -228,24 +235,33 @@ class ThreeSatelliteExpander:
             # Combine all states into single vector for integration
             y0 = np.concatenate(states)
             
+            include_j2 = self.include_j2
+
             def dynamics(t, y):
-                """Three-body orbital dynamics."""
+                """Three-satellite orbital dynamics with optional J2."""
                 accelerations = []
                 for i in range(3):
                     r = y[i*6 : i*6+3]
                     r_norm = np.linalg.norm(r)
                     if r_norm > 0:
                         acc = -self.mu * r / r_norm**3
+                        if include_j2:
+                            z = r[2]
+                            re = R_EARTH_EQUATORIAL
+                            factor = 1.5 * J2_EARTH * self.mu * re**2 / r_norm**5
+                            zr2 = (z / r_norm) ** 2
+                            acc[0] += factor * r[0] * (5 * zr2 - 1)
+                            acc[1] += factor * r[1] * (5 * zr2 - 1)
+                            acc[2] += factor * r[2] * (5 * zr2 - 3)
                     else:
                         acc = np.zeros(3)
                     accelerations.append(acc)
-                
-                # Return velocities + accelerations
+
                 result = []
                 for i in range(3):
-                    result.extend(y[i*6+3 : i*6+6])  # velocities
-                    result.extend(accelerations[i])   # accelerations
-                
+                    result.extend(y[i*6+3 : i*6+6])
+                    result.extend(accelerations[i])
+
                 return np.array(result)
             
             # Sample during this period (10 Hz)

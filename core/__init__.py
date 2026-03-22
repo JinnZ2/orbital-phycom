@@ -9,4 +9,7 @@ __version__ = "0.1.0"
 __all__ = [
     "OrbitalSimulator",
     "ThreeSatelliteExpander",
+    "PhaseRateNoiseModel",
+    "SeedRecoverer",
+    "DetectionAnalyzer",
 ]
