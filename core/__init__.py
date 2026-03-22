@@ -12,4 +12,5 @@ __all__ = [
     "PhaseRateNoiseModel",
     "SeedRecoverer",
     "DetectionAnalyzer",
+    "EnhancedRecoverer",
 ]
