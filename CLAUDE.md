@@ -34,6 +34,15 @@ atmospheric/                # Atmospheric seed expansion & thermal dynamics
   thermal_dynamics.py         # AtmosphericSimulator + AtmosphericSeedExpander
   ground_calibration.py       # GroundThermalController + GroundAtmosphericCoupler
 
+nutrient_cycling/           # Biogeochemical nutrient cycling & narrative detection
+  nutrient_constants.py       # Physical constants for N, P, K, soil, agriculture
+  nitrogen_fixation.py        # Lightning, bacterial, atmospheric, compost N pathways
+  phosphorus_recovery.py      # Sewage, food waste, dump, rock P recovery
+  potassium_cycling.py        # Weathering, ocean spray, ash, rock dust, human waste K
+  soil_biology.py             # SOM restoration, microbial biomass, yield improvement
+  local_capacity.py           # Integrated food security calculator (Liebig's law)
+  narrative_detector.py       # Narrative vs physics claim analysis
+
 robotics/                   # Hydrodynamic joint mechanics
   synovial_joint.py           # GeometricSeedController + HydrodynamicJointSimulator
   joint_visualization.py      # Joint pattern comparison visualization
