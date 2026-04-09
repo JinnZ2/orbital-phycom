@@ -1,0 +1,32 @@
+{
+  "fieldlink_version": "1.0",
+  "name": "Nexus-emergency-management",
+  "description": "Emergency management interface and resources for coordinated crisis response",
+  "repository": {
+    "url": "https://github.com/JinnZ2/Nexus-emergency-management",
+    "default_branch": "main",
+    "language": "TypeScript"
+  },
+  "relationship": {
+    "type": "companion",
+    "direction": "bidirectional",
+    "shared_concepts": [
+      "orbital-awareness",
+      "real-time-monitoring",
+      "resilience-infrastructure",
+      "crisis-communication"
+    ],
+    "integration_points": [
+      "Orbital PHYCOM stealth comms can serve as backup communication during infrastructure failure",
+      "Emergency management data can inform orbital schedule priorities",
+      "Seed expansion provides deterministic fallback when conventional networks fail"
+    ]
+  },
+  "entry_points": [
+    {
+      "path": "README.md",
+      "description": "Project overview and quickstart"
+    }
+  ],
+  "tags": ["emergency", "management", "nexus", "resilience", "communication"]
+}

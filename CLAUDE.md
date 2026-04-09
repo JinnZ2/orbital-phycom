@@ -53,6 +53,19 @@ simulations/                # Executable demonstrations
   03_full_pipeline_demo.py    # Full encode→noise→detect→recover pipeline (~3-5 min)
   04_ground_atmospheric_coupling.py
 
+fieldlink/                  # Cross-repository connections
+  nexus_emergency_management.fieldlink.json  # Link to Nexus-emergency-management
+  infrastructure_assistance.fieldlink.json   # Link to Infrastructure-assistance
+
+ai/                         # AI agent entry point, navigation & training
+  README.md                   # Safe entry point for AI agents
+  safety_boundaries.md        # Operating limits and safe exploration zones
+  navigation.json             # Machine-readable codebase map
+  training/                   # AI training & solution space exploration
+    explore_solution_space.py   # Interactive parameter sweep tool
+    codebase_map.py             # Programmatic codebase discovery
+    exercises.json              # Guided learning exercises
+
 Thermopylae/                # Orbital thermal ecosystem architecture (JSON specs)
 docs/                       # Documentation (QUICKSTART.md)
 ```

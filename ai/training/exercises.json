@@ -1,0 +1,105 @@
+{
+  "schema_version": "1.0",
+  "exercises": [
+    {
+      "id": "ex01",
+      "title": "Seed Expansion Basics",
+      "difficulty": "beginner",
+      "description": "Generate an orbital schedule from a single seed and verify deterministic expansion",
+      "steps": [
+        "Read core/seed_expander.py and identify the ThreeSatelliteExpander class",
+        "Create a seed with 15 values (5 per satellite), each in [0.0, 1.0]",
+        "Call expand_seed() and examine the output schedule",
+        "Change one seed value by 0.01 and observe how the schedule changes",
+        "Verify that the same seed always produces the same schedule"
+      ],
+      "key_files": ["core/seed_expander.py", "core/physics_constants.py"],
+      "expected_insight": "Small seed changes produce measurably different schedules, but the mapping is deterministic"
+    },
+    {
+      "id": "ex02",
+      "title": "Noise Sensitivity Analysis",
+      "difficulty": "beginner",
+      "description": "Understand how observation noise affects seed recovery",
+      "steps": [
+        "Read core/noise_model.py to understand noise sources",
+        "Run simulations/01_basic_orbital_sim.py and note the SNR",
+        "Modify noise amplitude in the simulation and observe recovery quality",
+        "Plot recovery error vs noise amplitude"
+      ],
+      "key_files": ["core/noise_model.py", "core/seed_recovery.py"],
+      "expected_insight": "Recovery degrades gracefully with noise; matched filtering provides ~4x SNR improvement"
+    },
+    {
+      "id": "ex03",
+      "title": "Detection Threshold Mapping",
+      "difficulty": "intermediate",
+      "description": "Map the relationship between delta-V impulse magnitude and detection probability",
+      "steps": [
+        "Read core/detection.py and understand the matched filter approach",
+        "Use explore_solution_space.py to sweep delta-V from 0.1 to 5.0 mm/s",
+        "Record detection probability at each level",
+        "Identify the minimum reliable detection threshold",
+        "Compare with the theoretical Pd vs delta-V curve"
+      ],
+      "key_files": ["core/detection.py", "core/orbital_dynamics.py"],
+      "expected_insight": "Detection probability transitions sharply around 0.5 mm/s; below this, stealth is nearly guaranteed"
+    },
+    {
+      "id": "ex04",
+      "title": "Constellation Geometry Effects",
+      "difficulty": "intermediate",
+      "description": "Explore how satellite period ratios affect communication capacity",
+      "steps": [
+        "Read core/seed_expander.py, focusing on the prime harmonic ratios (2:3:5)",
+        "Use explore_solution_space.py to try alternative ratios",
+        "Measure channel independence for each ratio set",
+        "Explain why prime ratios minimize cross-channel interference"
+      ],
+      "key_files": ["core/seed_expander.py", "simulations/02_three_satellite_demo.py"],
+      "expected_insight": "Prime harmonic ratios create maximally independent channels; non-prime ratios introduce correlated errors"
+    },
+    {
+      "id": "ex05",
+      "title": "End-to-End Protocol Validation",
+      "difficulty": "advanced",
+      "description": "Trace a message through the complete PHYCOM pipeline",
+      "steps": [
+        "Encode a test message into a seed",
+        "Expand the seed into orbital maneuvers",
+        "Add realistic noise (solar storm conditions)",
+        "Detect impulses using matched filtering",
+        "Recover the original seed from noisy observations",
+        "Compare recovered message with original",
+        "Identify the weakest link in the pipeline"
+      ],
+      "key_files": [
+        "core/seed_expander.py",
+        "core/orbital_dynamics.py",
+        "core/noise_model.py",
+        "core/detection.py",
+        "core/seed_recovery.py",
+        "simulations/03_full_pipeline_demo.py"
+      ],
+      "expected_insight": "Seed recovery is the bottleneck; codebook-based approaches could dramatically improve accuracy"
+    },
+    {
+      "id": "ex06",
+      "title": "Cross-Repository Integration",
+      "difficulty": "advanced",
+      "description": "Explore how orbital PHYCOM connects to emergency management and infrastructure resilience",
+      "steps": [
+        "Read fieldlink/nexus_emergency_management.fieldlink.json",
+        "Read fieldlink/infrastructure_assistance.fieldlink.json",
+        "Identify three scenarios where low-bandwidth orbital comms aid emergency response",
+        "Propose an integration point between PHYCOM and infrastructure decay monitoring",
+        "Document the data flow between systems"
+      ],
+      "key_files": [
+        "fieldlink/nexus_emergency_management.fieldlink.json",
+        "fieldlink/infrastructure_assistance.fieldlink.json"
+      ],
+      "expected_insight": "PHYCOM provides a resilient backup communication layer when conventional infrastructure fails"
+    }
+  ]
+}
