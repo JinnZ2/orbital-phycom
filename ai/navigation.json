@@ -1,0 +1,99 @@
+{
+  "schema_version": "1.0",
+  "project": "orbital-phycom",
+  "description": "Physics-Based Communications via Orbital Deviation",
+  "entry_point": "ai/README.md",
+  "modules": {
+    "core": {
+      "description": "Orbital mechanics and seed expansion engines (foundational layer)",
+      "files": {
+        "orbital_dynamics.py": "Orbital propagation with J2 perturbation + segmented impulses",
+        "seed_expander.py": "3-satellite constellation seed expansion (VNB frame, J2-aware)",
+        "noise_model.py": "Phase-rate noise sources + link budget analysis",
+        "seed_recovery.py": "Inverse problem: noisy observations to seed reconstruction",
+        "detection.py": "Signal detectability analysis (ROC, matched filter, Pd vs delta-V)",
+        "physics_constants.py": "Fundamental constants (SI units, includes J2)",
+        "celestrak.py": "TLE harvesting from CelesTrak catalog",
+        "debris_tracker.py": "Orbital debris tracking via SGP4",
+        "drag_force.py": "Exponential atmosphere + drag acceleration"
+      },
+      "key_classes": [
+        "OrbitalSimulator",
+        "ThreeSatelliteExpander",
+        "NoiseModel",
+        "SeedRecovery",
+        "DetectionAnalyzer"
+      ],
+      "dependencies": ["numpy", "scipy", "matplotlib"]
+    },
+    "atmospheric": {
+      "description": "Atmospheric seed expansion and thermal dynamics",
+      "files": {
+        "thermal_dynamics.py": "AtmosphericSimulator + AtmosphericSeedExpander",
+        "ground_calibration.py": "GroundThermalController + GroundAtmosphericCoupler"
+      },
+      "builds_on": ["core"]
+    },
+    "nutrient_cycling": {
+      "description": "Biogeochemical nutrient cycling and narrative detection",
+      "files": {
+        "nutrient_constants.py": "Physical constants for N, P, K, soil, agriculture",
+        "nitrogen_fixation.py": "Lightning, bacterial, atmospheric, compost N pathways",
+        "phosphorus_recovery.py": "Sewage, food waste, dump, rock P recovery",
+        "potassium_cycling.py": "Weathering, ocean spray, ash, rock dust, human waste K",
+        "soil_biology.py": "SOM restoration, microbial biomass, yield improvement",
+        "local_capacity.py": "Integrated food security calculator (Liebig's law)",
+        "narrative_detector.py": "Narrative vs physics claim analysis"
+      },
+      "builds_on": ["core"]
+    },
+    "robotics": {
+      "description": "Hydrodynamic joint mechanics",
+      "files": {
+        "synovial_joint.py": "GeometricSeedController + HydrodynamicJointSimulator",
+        "joint_visualization.py": "Joint pattern comparison visualization"
+      },
+      "builds_on": ["core"]
+    },
+    "simulations": {
+      "description": "Executable demonstrations (run these to see the system in action)",
+      "files": {
+        "01_basic_orbital_sim.py": "2-satellite system (~30 sec)",
+        "02_three_satellite_demo.py": "3-satellite harmonic network (~2 min)",
+        "03_full_pipeline_demo.py": "Full encode/noise/detect/recover pipeline (~3-5 min)",
+        "04_ground_atmospheric_coupling.py": "Ground-atmospheric coupling demo"
+      },
+      "builds_on": ["core", "atmospheric"]
+    },
+    "Thermopylae": {
+      "description": "Orbital thermal ecosystem architecture (JSON specs)",
+      "files": {
+        "Thermopylae-cascade.json": "Cascade thermal model",
+        "Thermopylae-platform.json": "Platform specification",
+        "Thermopylae-sim.json": "Simulation configuration",
+        "Thermopylae-swarm.json": "Swarm dynamics",
+        "bootstrap-economics.json": "Economic bootstrap model",
+        "orbital-evolution.json": "Orbital evolution parameters",
+        "space-data-center.md": "Space data center design",
+        "thermal-comms.json": "Thermal communications spec",
+        "thermal-phase.json": "Thermal phase model"
+      }
+    },
+    "fieldlink": {
+      "description": "Cross-repository connections to companion projects",
+      "files": {
+        "nexus_emergency_management.fieldlink.json": "Link to Nexus-emergency-management repo",
+        "infrastructure_assistance.fieldlink.json": "Link to Infrastructure-assistance repo"
+      }
+    }
+  },
+  "learning_path": [
+    {"step": 1, "action": "Read ai/safety_boundaries.md", "why": "Understand safe operating limits"},
+    {"step": 2, "action": "Read core/physics_constants.py", "why": "Learn the fundamental constants"},
+    {"step": 3, "action": "Read core/seed_expander.py", "why": "Understand seed expansion (core innovation)"},
+    {"step": 4, "action": "Run simulations/01_basic_orbital_sim.py", "why": "See the system in action"},
+    {"step": 5, "action": "Read core/orbital_dynamics.py", "why": "Understand the physics engine"},
+    {"step": 6, "action": "Run simulations/02_three_satellite_demo.py", "why": "See multi-satellite coordination"},
+    {"step": 7, "action": "Explore fieldlink/*.fieldlink.json", "why": "Discover companion projects"}
+  ]
+}

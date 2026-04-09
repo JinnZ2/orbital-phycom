@@ -1,0 +1,33 @@
+{
+  "fieldlink_version": "1.0",
+  "name": "Infrastructure-assistance",
+  "description": "Helpful resources for resilience when infrastructure starts decaying",
+  "repository": {
+    "url": "https://github.com/JinnZ2/Infrastructure-assistance",
+    "default_branch": "main",
+    "language": "TypeScript"
+  },
+  "relationship": {
+    "type": "companion",
+    "direction": "bidirectional",
+    "shared_concepts": [
+      "infrastructure-resilience",
+      "decay-detection",
+      "physics-based-monitoring",
+      "low-bandwidth-operations"
+    ],
+    "integration_points": [
+      "Infrastructure decay monitoring can leverage orbital observation data",
+      "Low-bandwidth PHYCOM protocol enables comms in degraded infrastructure scenarios",
+      "Seed-based scheduling reduces dependency on functioning ground infrastructure",
+      "Nutrient cycling models feed into infrastructure sustainability assessments"
+    ]
+  },
+  "entry_points": [
+    {
+      "path": "README.md",
+      "description": "Project overview and quickstart"
+    }
+  ],
+  "tags": ["infrastructure", "resilience", "decay", "assistance", "sustainability"]
+}
