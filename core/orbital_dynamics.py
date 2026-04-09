@@ -74,6 +74,8 @@ class OrbitalSimulator:
             J2 acceleration vector in m/s^2
         """
         r = np.linalg.norm(r_vec)
+        if r < 1.0:
+            return np.zeros(3)
         z = r_vec[2]
         re = R_EARTH_EQUATORIAL
         factor = 1.5 * J2_EARTH * self.mu * re**2 / r**5
@@ -96,6 +98,8 @@ class OrbitalSimulator:
             Acceleration vector in m/s^2
         """
         r_norm = np.linalg.norm(r_vec)
+        if r_norm < 1.0:
+            return np.zeros(3)
         acc = -self.mu * r_vec / r_norm**3
         if self.include_j2:
             acc += self._j2_acceleration(r_vec)
@@ -178,6 +182,8 @@ class OrbitalSimulator:
         range_dist = np.linalg.norm(d)
         
         # Range rate
+        if range_dist < 1.0:
+            return 0.0, range_dist
         range_rate = np.dot(d, vB - vA) / range_dist
         
         # Phase rate = (2π/λ) * range_rate

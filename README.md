@@ -205,14 +205,17 @@ What Makes This Novel
 	•	Survives 10× noise increase (solar storms)
 
 orbital-phycom/
-├── core/              # Orbital mechanics + seed expansion
-├── detection/         # Signal processing algorithms
-├── network/           # Multi-satellite systems
-├── protocol/          # Complete PHYCOM protocol
+├── core/              # Orbital mechanics + seed expansion engines
+├── atmospheric/       # Atmospheric seed expansion & thermal dynamics
+├── nutrient_cycling/  # Biogeochemical nutrient cycling & narrative detection
+├── robotics/          # Hydrodynamic joint mechanics
 ├── simulations/       # Runnable demos
-├── analysis/          # Theory + capacity calculations
+├── Thermopylae/       # Orbital thermal ecosystem architecture
+├── fieldlink/         # Cross-repository connections
+├── ai/                # AI agent entry point, navigation & training
+├── tests/             # Pytest test suite
 ├── docs/              # Specifications + guides
-└── tests/             # Unit tests
+└── .github/           # CI/CD workflows
 
 
 Use Cases
