@@ -1,0 +1,154 @@
+{
+  "schema_version": "1.0",
+  "description": "Canonical 15-value seeds with known characteristics. Each seed is a 3x5 matrix: 3 satellites x 5 directional components [prograde, retrograde, outward, inward, north].",
+  "seed_format": {
+    "length": 15,
+    "structure": "3 satellites x 5 components",
+    "components": [
+      "prograde",
+      "retrograde",
+      "outward",
+      "inward",
+      "north"
+    ],
+    "value_range": [
+      0.0,
+      1.0
+    ],
+    "note": "6th component (south) derived by normalization: 1.0 - sum(others)"
+  },
+  "seeds": {
+    "neutral": {
+      "values": [
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666,
+        0.16666666666666666
+      ],
+      "description": "Uniform allocation - each of 6 directions gets equal weight. Produces minimal net delta-V (drift only).",
+      "expected_behavior": "Low signal energy, near-baseline phase rates",
+      "use_case": "Baseline reference for detection analysis"
+    },
+    "prograde_heavy": {
+      "values": [
+        0.6,
+        0.0,
+        0.1,
+        0.0,
+        0.15,
+        0.6,
+        0.0,
+        0.1,
+        0.0,
+        0.15,
+        0.6,
+        0.0,
+        0.1,
+        0.0,
+        0.15
+      ],
+      "description": "All satellites push prograde - raises all orbits in unison.",
+      "expected_behavior": "Large positive range-rate change, high detectability",
+      "use_case": "High-SNR reference, easy detection test"
+    },
+    "retrograde_heavy": {
+      "values": [
+        0.0,
+        0.6,
+        0.1,
+        0.0,
+        0.15,
+        0.0,
+        0.6,
+        0.1,
+        0.0,
+        0.15,
+        0.0,
+        0.6,
+        0.1,
+        0.0,
+        0.15
+      ],
+      "description": "All satellites push retrograde - lowers all orbits.",
+      "expected_behavior": "Large negative range-rate change, mirror of prograde_heavy",
+      "use_case": "Sign symmetry validation"
+    },
+    "differential": {
+      "values": [
+        0.6,
+        0.0,
+        0.1,
+        0.0,
+        0.15,
+        0.0,
+        0.6,
+        0.1,
+        0.0,
+        0.15,
+        0.2,
+        0.2,
+        0.2,
+        0.2,
+        0.1
+      ],
+      "description": "Satellites maneuver differently - creates relative phase-rate signature.",
+      "expected_behavior": "Strong differential phase rates between pairs",
+      "use_case": "Test multi-channel independence"
+    },
+    "radial_push": {
+      "values": [
+        0.1,
+        0.1,
+        0.6,
+        0.0,
+        0.1,
+        0.1,
+        0.1,
+        0.6,
+        0.0,
+        0.1,
+        0.1,
+        0.1,
+        0.6,
+        0.0,
+        0.1
+      ],
+      "description": "All satellites push radially outward.",
+      "expected_behavior": "Altitude excursion, returns to original orbit per Kepler",
+      "use_case": "Test radial vs tangential response"
+    },
+    "test_message_alpha": {
+      "values": [
+        0.6,
+        0.0,
+        0.2,
+        0.0,
+        0.2,
+        0.2,
+        0.2,
+        0.2,
+        0.2,
+        0.2,
+        0.1,
+        0.1,
+        0.5,
+        0.1,
+        0.2
+      ],
+      "description": "The standard test seed used across core module quick_tests.",
+      "expected_behavior": "Mixed signal - each satellite has distinct profile",
+      "use_case": "Canonical regression test vector"
+    }
+  }
+}

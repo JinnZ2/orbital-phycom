@@ -1,0 +1,82 @@
+{
+  "schema_version": "1.0",
+  "description": "Reference solutions for training exercises in ../exercises.json",
+  "solutions": {
+    "ex01_seed_expansion_basics": {
+      "question": "Does a 0.01 perturbation to seed[0] produce measurable output change?",
+      "answer": "Yes",
+      "max_phase_rate_deviation": 0.0012345730210654438,
+      "is_deterministic": true,
+      "insight": "The mapping is deterministic and sensitive to small seed changes"
+    },
+    "ex02_noise_sensitivity": {
+      "question": "How does SNR scale with noise amplitude?",
+      "answer": "SNR = signal / noise, linear in 1/noise",
+      "total_noise_std": 0.5146124312708547,
+      "snr_table": {
+        "noise_1e-06": 1000.0000000000001,
+        "noise_1e-05": 100.0,
+        "noise_1e-04": 10.0,
+        "noise_1e-03": 1.0
+      },
+      "insight": "Matched filtering provides ~sqrt(N) SNR improvement over threshold detection"
+    },
+    "ex03_detection_threshold": {
+      "question": "What is the minimum delta-V for reliable detection?",
+      "answer": "Depends on noise floor and Pfa target",
+      "detection_table": {
+        "dv_0.10mm_s": {
+          "pd": 0.00019822917393863548,
+          "snr_db": -15.060859967240248
+        },
+        "dv_0.50mm_s": {
+          "pd": 0.0022835144953365916,
+          "snr_db": -1.0814598805198725
+        },
+        "dv_1.00mm_s": {
+          "pd": 0.02540070416172513,
+          "snr_db": 4.939140032759751
+        },
+        "dv_2.00mm_s": {
+          "pd": 0.42571642443478497,
+          "snr_db": 10.959739946039376
+        },
+        "dv_5.00mm_s": {
+          "pd": 0.9999998391748187,
+          "snr_db": 18.91854011948013
+        }
+      },
+      "insight": "Detection probability rises sharply once SNR exceeds ~10 dB"
+    },
+    "ex04_constellation_geometry": {
+      "question": "Why do prime harmonic ratios minimize channel cross-talk?",
+      "answer": "Co-prime periods have maximum LCM, so satellites revisit the same relative geometry only after many orbits",
+      "prime_ratios_25": {
+        "ratios": [
+          2,
+          3,
+          5
+        ],
+        "lcm": 30,
+        "independent": true
+      },
+      "non_prime_246": {
+        "ratios": [
+          2,
+          4,
+          6
+        ],
+        "lcm": 12,
+        "independent": false
+      },
+      "insight": "Prime ratios produce longer repeat periods = more distinct phase combinations"
+    },
+    "ex05_end_to_end_pipeline": {
+      "question": "Can a seed be recovered from its own clean output?",
+      "answer": "Yes, with correlation ~1.0",
+      "self_correlation": 1.0,
+      "bottleneck": "Recovery degrades rapidly with noise; codebook approaches are the next step",
+      "insight": "Seed recovery is the bottleneck, not detection or encoding"
+    }
+  }
+}
