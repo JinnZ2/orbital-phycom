@@ -1,0 +1,401 @@
+{
+  "schema_version": "1.0",
+  "description": "Pre-computed solution space map. AI agents should query this instead of re-running explore_solution_space.py unless they need a custom parameter sweep.",
+  "generated_by": "ai/training/explore_solution_space.py",
+  "results": {
+    "seed_space": {
+      "num_seeds": 15,
+      "seed_dimension": 15,
+      "satellites": 3,
+      "values_per_satellite": 5,
+      "components": [
+        "prograde",
+        "retrograde",
+        "outward",
+        "inward",
+        "north"
+      ],
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "sensitivity": [
+        {
+          "perturbation": 0.0001,
+          "delta_v_change_m_s": 1.9999999999997797e-07
+        },
+        {
+          "perturbation": 0.00021544346900318845,
+          "delta_v_change_m_s": 4.3088693800630296e-07
+        },
+        {
+          "perturbation": 0.00046415888336127773,
+          "delta_v_change_m_s": 9.283177667225307e-07
+        },
+        {
+          "perturbation": 0.001,
+          "delta_v_change_m_s": 2.000000000000002e-06
+        },
+        {
+          "perturbation": 0.002154434690031882,
+          "delta_v_change_m_s": 4.308869380063696e-06
+        },
+        {
+          "perturbation": 0.004641588833612777,
+          "delta_v_change_m_s": 9.283177667225528e-06
+        },
+        {
+          "perturbation": 0.01,
+          "delta_v_change_m_s": 2.000000000000002e-05
+        },
+        {
+          "perturbation": 0.021544346900318822,
+          "delta_v_change_m_s": 4.3088693800637626e-05
+        },
+        {
+          "perturbation": 0.046415888336127774,
+          "delta_v_change_m_s": 9.283177667225551e-05
+        },
+        {
+          "perturbation": 0.1,
+          "delta_v_change_m_s": 0.00019999999999999996
+        }
+      ],
+      "delta_v_stats": {
+        "min_m_s": 0.0016043115034939052,
+        "max_m_s": 0.002613593797010454,
+        "mean_m_s": 0.0021264955640913543,
+        "std_m_s": 0.00030579098243810045
+      }
+    },
+    "noise_space": {
+      "true_delta_v_m_s": 0.002442486556186603,
+      "num_levels": 12,
+      "noise_range_m_s": [
+        9.999999999999999e-06,
+        0.01
+      ],
+      "recovery_results": [
+        {
+          "noise_amplitude_m_s": 9.999999999999999e-06,
+          "snr": 244.24865561866034,
+          "relative_error": 0.014310504821190315,
+          "recoverable": true
+        },
+        {
+          "noise_amplitude_m_s": 1.873817422860383e-05,
+          "snr": 130.348161266328,
+          "relative_error": 0.019842983869402097,
+          "recoverable": true
+        },
+        {
+          "noise_amplitude_m_s": 3.511191734215127e-05,
+          "snr": 69.5628932019169,
+          "relative_error": 0.04962796497931655,
+          "recoverable": true
+        },
+        {
+          "noise_amplitude_m_s": 6.579332246575683e-05,
+          "snr": 37.1236238671156,
+          "relative_error": 0.0801354464033338,
+          "recoverable": true
+        },
+        {
+          "noise_amplitude_m_s": 0.0001232846739442066,
+          "snr": 19.811761495122813,
+          "relative_error": 0.10767511761739534,
+          "recoverable": false
+        },
+        {
+          "noise_amplitude_m_s": 0.0002310129700083158,
+          "snr": 10.572941233986475,
+          "relative_error": 0.22448360051099306,
+          "recoverable": false
+        },
+        {
+          "noise_amplitude_m_s": 0.0004328761281083057,
+          "snr": 5.642460735500508,
+          "relative_error": 0.4625439774332651,
+          "recoverable": false
+        },
+        {
+          "noise_amplitude_m_s": 0.0008111308307896872,
+          "snr": 3.011211586925734,
+          "relative_error": 0.8024832394526396,
+          "recoverable": false
+        },
+        {
+          "noise_amplitude_m_s": 0.0015199110829529332,
+          "snr": 1.6069930560946104,
+          "relative_error": 1.430594167320374,
+          "recoverable": false
+        },
+        {
+          "noise_amplitude_m_s": 0.002848035868435799,
+          "snr": 0.857603860701399,
+          "relative_error": 3.2922848790203756,
+          "recoverable": false
+        },
+        {
+          "noise_amplitude_m_s": 0.005336699231206307,
+          "snr": 0.4576773864084717,
+          "relative_error": 10.10664973870445,
+          "recoverable": false
+        },
+        {
+          "noise_amplitude_m_s": 0.01,
+          "snr": 0.2442486556186603,
+          "relative_error": 8.539837641006015,
+          "recoverable": false
+        }
+      ],
+      "recovery_threshold_snr": 10.0,
+      "recoverable_fraction": 0.3333333333333333
+    },
+    "detection_space": {
+      "num_points": 15,
+      "delta_v_range_mm_s": [
+        0.1,
+        5.0
+      ],
+      "noise_floor_mm_s": 0.3,
+      "detection_results": [
+        {
+          "delta_v_m_s": 0.0001,
+          "delta_v_mm_s": 0.1,
+          "snr": 0.33333333333333337,
+          "pd_analytical": 0.0066928509242848554,
+          "pd_monte_carlo": 0.06,
+          "stealth": true
+        },
+        {
+          "delta_v_m_s": 0.00045,
+          "delta_v_mm_s": 0.45,
+          "snr": 1.5,
+          "pd_analytical": 0.18242552380635635,
+          "pd_monte_carlo": 0.32,
+          "stealth": true
+        },
+        {
+          "delta_v_m_s": 0.0008,
+          "delta_v_mm_s": 0.8,
+          "snr": 2.666666666666667,
+          "pd_analytical": 0.8807970779778825,
+          "pd_monte_carlo": 0.785,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.00115,
+          "delta_v_mm_s": 1.15,
+          "snr": 3.8333333333333335,
+          "pd_analytical": 0.995929862284104,
+          "pd_monte_carlo": 0.97,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.0015,
+          "delta_v_mm_s": 1.5,
+          "snr": 5.000000000000001,
+          "pd_analytical": 0.9998766054240137,
+          "pd_monte_carlo": 1.0,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.00185,
+          "delta_v_mm_s": 1.85,
+          "snr": 6.166666666666668,
+          "pd_analytical": 0.9999962733607158,
+          "pd_monte_carlo": 1.0,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.0021999999999999997,
+          "delta_v_mm_s": 2.1999999999999997,
+          "snr": 7.333333333333333,
+          "pd_analytical": 0.9999998874648379,
+          "pd_monte_carlo": 1.0,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.0025499999999999997,
+          "delta_v_mm_s": 2.55,
+          "snr": 8.5,
+          "pd_analytical": 0.9999999966017321,
+          "pd_monte_carlo": 1.0,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.0029,
+          "delta_v_mm_s": 2.9,
+          "snr": 9.666666666666666,
+          "pd_analytical": 0.9999999998973812,
+          "pd_monte_carlo": 1.0,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.00325,
+          "delta_v_mm_s": 3.25,
+          "snr": 10.833333333333334,
+          "pd_analytical": 0.9999999999969011,
+          "pd_monte_carlo": 1.0,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.0036,
+          "delta_v_mm_s": 3.6,
+          "snr": 12.0,
+          "pd_analytical": 0.9999999999999065,
+          "pd_monte_carlo": 1.0,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.00395,
+          "delta_v_mm_s": 3.95,
+          "snr": 13.16666666666667,
+          "pd_analytical": 0.9999999999999971,
+          "pd_monte_carlo": 1.0,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.0043,
+          "delta_v_mm_s": 4.3,
+          "snr": 14.333333333333334,
+          "pd_analytical": 1.0,
+          "pd_monte_carlo": 1.0,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.0046500000000000005,
+          "delta_v_mm_s": 4.65,
+          "snr": 15.500000000000004,
+          "pd_analytical": 1.0,
+          "pd_monte_carlo": 1.0,
+          "stealth": false
+        },
+        {
+          "delta_v_m_s": 0.005,
+          "delta_v_mm_s": 5.0,
+          "snr": 16.666666666666668,
+          "pd_analytical": 1.0,
+          "pd_monte_carlo": 1.0,
+          "stealth": false
+        }
+      ],
+      "stealth_boundary_mm_s": 0.8
+    },
+    "constellation_space": {
+      "altitude_ref_km": 500.0,
+      "num_configurations": 6,
+      "configurations": [
+        {
+          "name": "Prime (2:3:5)",
+          "ratios": [
+            2,
+            3,
+            5
+          ],
+          "type": "prime",
+          "channel_independence": 1.0,
+          "repeat_period_symbols": 30,
+          "unique_phase_combinations": 30,
+          "pair_gcds": [
+            1,
+            1,
+            1
+          ],
+          "recommended": true
+        },
+        {
+          "name": "Sequential (1:2:3)",
+          "ratios": [
+            1,
+            2,
+            3
+          ],
+          "type": "mixed",
+          "channel_independence": 1.0,
+          "repeat_period_symbols": 6,
+          "unique_phase_combinations": 6,
+          "pair_gcds": [
+            1,
+            1,
+            1
+          ],
+          "recommended": true
+        },
+        {
+          "name": "Fibonacci (2:3:5)",
+          "ratios": [
+            2,
+            3,
+            5
+          ],
+          "type": "fibonacci",
+          "channel_independence": 1.0,
+          "repeat_period_symbols": 30,
+          "unique_phase_combinations": 30,
+          "pair_gcds": [
+            1,
+            1,
+            1
+          ],
+          "recommended": true
+        },
+        {
+          "name": "Power (1:2:4)",
+          "ratios": [
+            1,
+            2,
+            4
+          ],
+          "type": "power",
+          "channel_independence": 0.5,
+          "repeat_period_symbols": 4,
+          "unique_phase_combinations": 4,
+          "pair_gcds": [
+            1,
+            2,
+            1
+          ],
+          "recommended": false
+        },
+        {
+          "name": "Co-prime (3:5:7)",
+          "ratios": [
+            3,
+            5,
+            7
+          ],
+          "type": "prime",
+          "channel_independence": 1.0,
+          "repeat_period_symbols": 105,
+          "unique_phase_combinations": 105,
+          "pair_gcds": [
+            1,
+            1,
+            1
+          ],
+          "recommended": true
+        },
+        {
+          "name": "Non-prime (2:4:6)",
+          "ratios": [
+            2,
+            4,
+            6
+          ],
+          "type": "composite",
+          "channel_independence": 0.5,
+          "repeat_period_symbols": 12,
+          "unique_phase_combinations": 12,
+          "pair_gcds": [
+            2,
+            2,
+            2
+          ],
+          "recommended": false
+        }
+      ]
+    }
+  }
+}

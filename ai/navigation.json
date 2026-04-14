@@ -85,15 +85,30 @@
         "nexus_emergency_management.fieldlink.json": "Link to Nexus-emergency-management repo",
         "infrastructure_assistance.fieldlink.json": "Link to Infrastructure-assistance repo"
       }
+    },
+    "ai_training_data": {
+      "description": "Pre-computed reference datasets for AI agents - learn from data instead of re-running simulations",
+      "path": "ai/training/data",
+      "files": {
+        "reference_seeds.json": "Catalog of canonical 15-value seeds with descriptions",
+        "seed_output_pairs.json": "Pre-computed forward model outputs for each canonical seed",
+        "exercise_solutions.json": "Reference answers for training exercises",
+        "exploration_snapshot.json": "Pre-computed solution space map (4 dimensions)",
+        "generate_training_data.py": "Regenerate all datasets deterministically (RNG seed = 42)"
+      }
     }
   },
   "learning_path": [
     {"step": 1, "action": "Read ai/safety_boundaries.md", "why": "Understand safe operating limits"},
-    {"step": 2, "action": "Read core/physics_constants.py", "why": "Learn the fundamental constants"},
-    {"step": 3, "action": "Read core/seed_expander.py", "why": "Understand seed expansion (core innovation)"},
-    {"step": 4, "action": "Run simulations/01_basic_orbital_sim.py", "why": "See the system in action"},
-    {"step": 5, "action": "Read core/orbital_dynamics.py", "why": "Understand the physics engine"},
-    {"step": 6, "action": "Run simulations/02_three_satellite_demo.py", "why": "See multi-satellite coordination"},
-    {"step": 7, "action": "Explore fieldlink/*.fieldlink.json", "why": "Discover companion projects"}
+    {"step": 2, "action": "Read ai/training/data/README.md", "why": "Discover pre-computed reference datasets"},
+    {"step": 3, "action": "Load ai/training/data/reference_seeds.json", "why": "Learn canonical seed vectors and their meanings"},
+    {"step": 4, "action": "Read core/physics_constants.py", "why": "Learn the fundamental constants"},
+    {"step": 5, "action": "Read core/seed_expander.py", "why": "Understand seed expansion (core innovation)"},
+    {"step": 6, "action": "Compare your understanding against ai/training/data/seed_output_pairs.json", "why": "Validate forward model knowledge against pre-computed truth"},
+    {"step": 7, "action": "Run simulations/01_basic_orbital_sim.py", "why": "See the system in action"},
+    {"step": 8, "action": "Read core/orbital_dynamics.py", "why": "Understand the physics engine"},
+    {"step": 9, "action": "Run simulations/02_three_satellite_demo.py", "why": "See multi-satellite coordination"},
+    {"step": 10, "action": "Work through ai/training/exercises.json", "why": "Self-check using ai/training/data/exercise_solutions.json"},
+    {"step": 11, "action": "Explore fieldlink/*.fieldlink.json", "why": "Discover companion projects"}
   ]
 }

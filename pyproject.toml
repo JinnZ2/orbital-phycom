@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "orbital-phycom"
+version = "0.1.0"
+description = "Physics-Based Communications via Orbital Deviation"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{name = "JinnZ2"}]
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "matplotlib>=3.5",
+    "sgp4>=2.20",
+    "requests>=2.25",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["core*", "atmospheric*", "nutrient_cycling*", "robotics*", "ai*", "fieldlink*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
