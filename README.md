@@ -118,7 +118,7 @@ If you use this work, please cite:
 And reference the foundational geometric intelligence framework:
 [github.com/JinnZ2/geometric-intelligence-core]
 License
-MIT - Use freely, modify freely, share freely.
+CC0-1.0 - Use freely, modify freely, share freely.
 Contributing
 Open issues for:
 	•	Extended constellation sizes (5+)
