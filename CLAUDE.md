@@ -154,3 +154,5 @@ No formal test framework. Validation is done via:
 ## License
 
 MIT
+
+License: MIT (current). Possible move to CC0 under review by owner, pending downstream users. Do not change without owner decision. (PR #8, MIT -> CC0, is held open as a draft and unmerged.)
