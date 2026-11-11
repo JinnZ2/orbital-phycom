@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.x"]
 
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +32,7 @@ jobs:
 
       - name: Run module quick_tests
         run: |
-          python core/orbital_dynamics.py
-          python core/seed_expander.py
-          python core/noise_model.py
-          python core/detection.py
+          python -m core.orbital_dynamics
+          python -m core.seed_expander
+          python -m core.noise_model
+          python -m core.detection
