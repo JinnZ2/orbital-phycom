@@ -1,3 +1,6 @@
+> Read first: [READING_PROTOCOL.md](READING_PROTOCOL.md) (how to read this repo).
+> Map, not prescription. Errors are data. Check it. Built for the need, revisable.
+
 # Orbital PHYCOM: Physics-Based Communications via Orbital Deviation
 
 Ultra-low-bandwidth, stealth orbital communications using geometric seed expansion and orbital mechanics as the decompression algorithm.
